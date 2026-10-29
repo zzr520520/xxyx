@@ -4,82 +4,84 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// 记录 App 启动时间戳，用于启动期高频撕除开屏遮罩
-static CFAbsoluteTime kAppLaunchTime = 0;
+static CFAbsoluteTime kAppStartTimestamp = 0;
 
 // ============================================================================
-// 1. 全量广告与追踪域名黑名单 (纯 C 静态常量数组，防内存释放崩溃)
+// 1. 全量广告域名黑名单 (包含最新抓包中的 sdk.beizi.biz 等全部三方域名)
 // ============================================================================
 static NSString * const kBlockedAdHosts[] = {
-    @"leadmoad.com",            // adsbid.leadmoad.com, ads-bid.leadmoad.com
-    @"adbiding.com",            // sdkconf.adbiding.com, sl.adbiding.com
-    @"tobidad.cn",              // c.tobidad.cn
+    @"leadmoad.com",
+    @"adbiding.com",
+    @"tobidad.cn",
     @"tobidad.com",
-    @"sigmob.cn",               // tm.sigmob.cn, dc.sigmob.cn, adservice.sigmob.cn
-    @"pangolin-sdk-toutiao",    // api-access.pangolin-sdk-toutiao.com / toutiao1.com / log-api
-    @"pglstatp-toutiao.com",    // sf3-fe-tos / sf6-fe-tos.pglstatp-toutiao.com
-    @"ctobsnssdk.com",          // toblog.ctobsnssdk.com
-    @"oceanengine.com",         // analytics.oceanengine.com
-    @"bdurl.net",               // dig.bdurl.net
-    @"bytescm.com",             // lf-cdn-tos.bytescm.com
+    @"sigmob.cn",
+    @"pangolin-sdk-toutiao",
+    @"pglstatp-toutiao.com",
+    @"ctobsnssdk.com",
+    @"oceanengine.com",
+    @"bdurl.net",
+    @"bytescm.com",
     @"bytegoofy.com",
-    @"volces.com",              // apmplus.volces.com
-    @"zijieapi.com",            // tnc3-alisc1.zijieapi.com
-    @"douyin.com",              // webcast-open.douyin.com (pangle setting)
+    @"volces.com",
+    @"zijieapi.com",
+    @"douyin.com",
     @"douyinstatic.com",
-    @"gdt.qq.com",              // mi.gdt.qq.com, c2.gdt.qq.com, win.gdt.qq.com, v2.gdt.qq.com
-    @"e.qq.com",                // sdk.e.qq.com
-    @"ugdtimg.com",             // pgdt.ugdtimg.com, adsmind.ugdtimg.com
+    @"gdt.qq.com",
+    @"e.qq.com",
+    @"ugdtimg.com",
     @"gdtimg.com",
     @"mobads.baidu.com",
-    @"baidu.com",               // als.baidu.com, pos.baidu.com
-    @"beizi.biz",               // sdk.beizi.biz
+    @"als.baidu.com",
+    @"pos.baidu.com",
+    @"beizi.biz",               // 抓包第11条: sdk.beizi.biz/v1/api/sdk/log/p/f
     @"adn-plus.com.cn",
     @"ad-scope.com.cn",
-    @"mentamob.com",            // api-v3.mentamob.com, api-nxs-v3/v4.mentamob.com
-    @"advlion.com",             // bj-td-menta-01-callback.advlion.com, td-nexus.advlion.com
+    @"mentamob.com",
+    @"advlion.com",
     @"vlion.cn",
-    @"fibo.cn",                 // kbsvr.fibo.cn
-    @"fancydsp.com",            // mpcfg.fancydsp.com
-    @"fancyapi.com",            // t2.fancyapi.com
-    @"dmrtb.com",               // dmsdk-api.dmrtb.com
-    @"richmob.cn",              // adsdk.richmob.cn
+    @"fibo.cn",
+    @"fancydsp.com",
+    @"fancyapi.com",
+    @"dmrtb.com",
+    @"richmob.cn",
     @"ubixioe.com",
     @"tanx.com",
-    @"1rtb.net",                // sdk.1rtb.net (美数 MSAdSDK)
+    @"1rtb.net",
     @"1rtb.com",
     @"yunxish.com",
     @"58iclick.com",
     @"iggrowth.cn",
     @"innotechx.com",
     @"etoolads.cn",
-    @"zhangyuyidong.cn",        // sdk.zhangyuyidong.cn
-    @"hubcloud.com.cn",         // sdktmp.hubcloud.com.cn
-    @"nwiztech.com",            // yyz-api.nwiztech.com
+    @"zhangyuyidong.cn",
+    @"hubcloud.com.cn",
+    @"nwiztech.com",
     @"kuaishou.com",
-    @"gifshow.com"
+    @"gifshow.com",
+    @"iadsdk.apple.com",        // 抓包第22条: ca.iadsdk.apple.com
+    @"adservices.apple.com"     // 抓包第20条: api-adservices.apple.com
 };
 
 static const size_t kBlockedAdHostsCount = sizeof(kBlockedAdHosts) / sizeof(kBlockedAdHosts[0]);
 
-static BOOL shouldBlockURL(NSURL *url) {
+static BOOL shouldBlockAdURL(NSURL *url) {
     if (!url || ![url isKindOfClass:[NSURL class]]) return NO;
     NSString *host = [url host];
     if (!host || ![host isKindOfClass:[NSString class]] || host.length == 0) return NO;
-
+    
     NSString *lowerHost = [host lowercaseString];
-
-    // 核心业务域名绝对放行
     if ([lowerHost containsString:@"xiaocantech.com"] ||
         [lowerHost containsString:@"realtech-inc.com"] ||
         [lowerHost containsString:@"xinyifm.cn"] ||
         [lowerHost containsString:@"hzaiguojiang.com"] ||
         [lowerHost containsString:@"djtaoke.cn"] ||
         [lowerHost containsString:@"fengkongcloud.com"] ||
-        [lowerHost containsString:@"qlogo.cn"]) {
+        [lowerHost containsString:@"qlogo.cn"] ||
+        [lowerHost containsString:@"map.qq.com"] ||
+        [lowerHost containsString:@"connect.qq.com"]) {
         return NO;
     }
-
+    
     for (size_t i = 0; i < kBlockedAdHostsCount; i++) {
         if ([lowerHost containsString:kBlockedAdHosts[i]]) {
             return YES;
@@ -88,76 +90,152 @@ static BOOL shouldBlockURL(NSURL *url) {
     return NO;
 }
 
-// 列出应用全部窗口（UIApplication.windows 在 iOS 15 起被标记废弃，这里局部屏蔽告警）
-static NSArray<UIWindow *> *xc_allWindows(void) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return [[UIApplication sharedApplication] windows];
-#pragma clang diagnostic pop
+// 检查是否为小蚕网关的开屏广告下发接口 (AdMobileService.MatchPlacement)
+static BOOL isXiaoCanAdPlacementRPC(NSURLRequest *request) {
+    if (!request || !request.URL) return NO;
+    NSString *absURL = [request.URL.absoluteString lowercaseString];
+    if (![absURL containsString:@"gw.xiaocantech.com/rpc"]) return NO;
+    
+    NSString *methodName = [request valueForHTTPHeaderField:@"methodname"];
+    NSString *serverName = [request valueForHTTPHeaderField:@"servername"];
+    
+    // 精准命中抓包第 9 条：methodname: AdMobileService.MatchPlacement / servername: SilkwormAd
+    if (methodName && ([methodName containsString:@"MatchPlacement"] || [methodName containsString:@"AdMobileService"])) {
+        return YES;
+    }
+    if (serverName && [serverName isEqualToString:@"SilkwormAd"]) {
+        return YES;
+    }
+    return NO;
 }
 
+
 // ============================================================================
-// 2. 直接 Hook NSURLSession 任务创建 (解决 NSURLProtocol 被私有 Session 绕过的问题)
+// 2. 协议层秒回伪造数据 (同时兼容 Alamofire Delegate 模式与闭包模式)
+// 解决上一版 AdMobileService.MatchPlacement 漏网返回 ad_open: 1 的问题！
+// ============================================================================
+@interface XCSuperAdBlockProtocol : NSURLProtocol
+@end
+
+@implementation XCSuperAdBlockProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:@"XCSuperAdHandled" inRequest:request]) {
+        return NO;
+    }
+    if (isXiaoCanAdPlacementRPC(request) || shouldBlockAdURL(request.URL)) {
+        return YES;
+    }
+    return NO;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *mutableReq = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"XCSuperAdHandled" inRequest:mutableReq];
+    
+    // 如果是小蚕自己的 AdMobileService.MatchPlacement，立即返回 ad_open = 0（关闭开屏！）
+    if (isXiaoCanAdPlacementRPC(self.request)) {
+        NSString *methodName = [self.request valueForHTTPHeaderField:@"methodname"] ?: @"";
+        NSString *fakeJson = @"{\"status\":{\"code\":0},\"data\":{\"ad_open\":0,\"ad_type\":[],\"ad_source\":[],\"ios_slot_id\":\"\",\"put_id\":0}}";
+        
+        if ([methodName containsString:@"GetUserInfo"]) {
+            fakeJson = @"{\"status\":{\"code\":0},\"data\":{\"module_open\":0,\"show_exchange_silk_entry\":false}}";
+        }
+        
+        NSData *data = [fakeJson dataUsingEncoding:NSUTF8StringEncoding];
+        NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                                                  statusCode:200
+                                                                 HTTPVersion:@"HTTP/1.1"
+                                                                headerFields:@{@"Content-Type": @"application/json"}];
+        [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didLoadData:data];
+        [self.client URLProtocolDidFinishLoading:self];
+        return;
+    }
+    
+    // 第三方广告 SDK 请求（包含 sdk.beizi.biz 上传等），直接秒抛 Cancelled 错误
+    NSError *cancelErr = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+    [self.client URLProtocol:self didFailWithError:cancelErr];
+}
+
+- (void)stopLoading {
+}
+
+@end
+
+
+// ============================================================================
+// 3. 拦截 NSURLSession 创建与所有 Task (确保 Alamofire 100% 走 XCSuperAdBlockProtocol)
 // ============================================================================
 %hook NSURLSession
 
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration delegate:(id<NSURLSessionDelegate>)delegate delegateQueue:(NSOperationQueue *)queue {
+    if (configuration) {
+        NSMutableArray *protocols = configuration.protocolClasses ? [configuration.protocolClasses mutableCopy] : [NSMutableArray array];
+        if (![protocols containsObject:[XCSuperAdBlockProtocol class]]) {
+            [protocols insertObject:[XCSuperAdBlockProtocol class] atIndex:0];
+            configuration.protocolClasses = protocols;
+        }
+    }
+    return %orig(configuration, delegate, queue);
+}
+
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration {
+    if (configuration) {
+        NSMutableArray *protocols = configuration.protocolClasses ? [configuration.protocolClasses mutableCopy] : [NSMutableArray array];
+        if (![protocols containsObject:[XCSuperAdBlockProtocol class]]) {
+            [protocols insertObject:[XCSuperAdBlockProtocol class] atIndex:0];
+            configuration.protocolClasses = protocols;
+        }
+    }
+    return %orig(configuration);
+}
+
+// 双保险：直接在 Task 入口处拦截
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable))completionHandler {
-    if (request && request.URL) {
-        // 1. 拦截小蚕自有网关的广告配置请求 (AdMobileService.MatchPlacement)
-        NSString *absURL = [request.URL.absoluteString lowercaseString];
-        if ([absURL containsString:@"gw.xiaocantech.com/rpc"]) {
-            NSString *methodHeader = [request valueForHTTPHeaderField:@"methodname"];
-            NSString *bodyStr = request.HTTPBody ? [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding] : @"";
-            if ((methodHeader && [methodHeader containsString:@"AdMobileService"]) ||
-                (bodyStr && [bodyStr containsString:@"MatchPlacement"])) {
-                if (completionHandler) {
-                    NSData *emptyAdData = [@"{\"status\":{\"code\":0},\"data\":{\"ad_open\":0,\"ad_type\":[],\"ad_source\":[]}}" dataUsingEncoding:NSUTF8StringEncoding];
-                    NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"application/json"}];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        completionHandler(emptyAdData, resp, nil);
-                    });
-                }
-                return %orig([NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:0/rpc_ad_blocked"]], nil);
-            }
-        }
-
-        // 2. 拦截所有三方广告 SDK 请求，当场秒回 Cancelled 错误，0 毫秒等待！
-        if (shouldBlockURL(request.URL)) {
-            if (completionHandler) {
-                NSError *cancelErr = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    completionHandler(nil, nil, cancelErr);
-                });
-            }
-            return %orig([NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:0/ad_blocked"]], nil);
-        }
-    }
-    return %orig;
-}
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    if (request && shouldBlockURL(request.URL)) {
-        return %orig([NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:0/ad_blocked"]]);
-    }
-    return %orig;
-}
-
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable))completionHandler {
-    if (shouldBlockURL(url)) {
+    if (isXiaoCanAdPlacementRPC(request)) {
         if (completionHandler) {
-            NSError *cancelErr = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+            NSData *data = [@"{\"status\":{\"code\":0},\"data\":{\"ad_open\":0,\"ad_type\":[],\"ad_source\":[],\"ios_slot_id\":\"\",\"put_id\":0}}" dataUsingEncoding:NSUTF8StringEncoding];
+            NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"application/json"}];
             dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler(nil, nil, cancelErr);
+                completionHandler(data, resp, nil);
             });
         }
-        return %orig([NSURL URLWithString:@"http://127.0.0.1:0/ad_blocked"], nil);
+        return %orig([NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:0/rpc_ad_blocked"]], nil);
+    }
+    if (request && shouldBlockAdURL(request.URL)) {
+        if (completionHandler) {
+            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completionHandler(nil, nil, err);
+            });
+        }
+        return %orig([NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:0/ad_blocked"]], nil);
     }
     return %orig;
 }
 
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
-    if (shouldBlockURL(url)) {
-        return %orig([NSURL URLWithString:@"http://127.0.0.1:0/ad_blocked"]);
+// 拦截抓包第 11 条 sdk.beizi.biz 的 uploadTask 请求
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable))completionHandler {
+    if (request && shouldBlockAdURL(request.URL)) {
+        if (completionHandler) {
+            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completionHandler(nil, nil, err);
+            });
+        }
+        return (NSURLSessionUploadTask *)[self dataTaskWithURL:[NSURL URLWithString:@"http://127.0.0.1:0/upload_blocked"]];
+    }
+    return %orig;
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData {
+    if (request && shouldBlockAdURL(request.URL)) {
+        return (NSURLSessionUploadTask *)[self dataTaskWithURL:[NSURL URLWithString:@"http://127.0.0.1:0/upload_blocked"]];
     }
     return %orig;
 }
@@ -166,217 +244,174 @@ static NSArray<UIWindow *> *xc_allWindows(void) {
 
 
 // ============================================================================
-// 3. 核心破局：强行撕掉 LaunchUtil.launchView 遮罩与独立 adWindow！
-// 为什么“大额红包”页面还在？因为它要么是盖在 FlutterViewController 顶上的 launchView，
-// 要么是 AdSplashWM / AdSplashMS 创建的第二层 UIWindow！
+// 4. 破除“白屏干等几秒”的杀手锏：快进开屏超时定时器 + 缩短 GCD 延迟！
+// 为什么之前会白屏等一会儿才进去？因为 App 启动时设置了 3~8 秒的开屏等待 Timer！
+// 我们直接把启动前 6 秒内所有 >0.3 秒的单次等待 Timer 缩短为 0.01 秒立即触发！
 // ============================================================================
+%hook NSTimer
 
-// 判断一个 View 或 VC 树里是否包含小蚕的 Flutter 主界面
-static BOOL containsMainFlutterOrTab(UIView *view) {
-    if (!view) return NO;
-    UIResponder *resp = [view nextResponder];
-    while (resp) {
-        NSString *respClass = NSStringFromClass([resp class]);
-        if ([respClass containsString:@"Flutter"] ||
-            [respClass containsString:@"TabBar"] ||
-            [respClass containsString:@"Navigation"] ||
-            [respClass containsString:@"Home"]) {
-            return YES;
++ (NSTimer *)scheduledTimerWithTimeInterval:(NSTimeInterval)ti target:(id)aTarget selector:(SEL)aSelector userInfo:(id)userInfo repeats:(BOOL)yesOrNo {
+    // 在 App 冷启动的前 6 秒内：
+    if (CFAbsoluteTimeGetCurrent() - kAppStartTimestamp < 6.0) {
+        NSString *targetClass = aTarget ? NSStringFromClass([aTarget class]) : @"";
+        NSString *selName = aSelector ? NSStringFromSelector(aSelector) : @"";
+        
+        // 如果定时器的 Target 是 LaunchUtil / AdManager / Splash，或者它是一个 1.0~10.0 秒的不重复超时定时器
+        if ([targetClass containsString:@"Launch"] ||
+            [targetClass containsString:@"Ad"] ||
+            [targetClass containsString:@"Splash"] ||
+            [selName containsString:@"splash"] ||
+            [selName containsString:@"timeout"] ||
+            [selName containsString:@"close"] ||
+            (!yesOrNo && ti >= 1.0 && ti <= 10.0)) {
+            ti = 0.01; // 8秒等待瞬间变成 0.01 秒！直接触发关闭进入首页！
         }
-        resp = [resp nextResponder];
     }
-    for (UIView *sub in view.subviews) {
-        NSString *subClass = NSStringFromClass([sub class]);
-        if ([subClass containsString:@"Flutter"] || [subClass containsString:@"TabBar"]) {
-            return YES;
-        }
-        if (containsMainFlutterOrTab(sub)) return YES;
-    }
-    return NO;
+    return %orig(ti, aTarget, aSelector, userInfo, yesOrNo);
 }
 
-// 递归检查一个视图树是否是全屏启动图/广告遮罩（包含全屏 UIImageView 或倒计时按钮，且不包含 Flutter 主界面）
-static BOOL isSplashOrLaunchOverlayView(UIView *view) {
-    if (!view || view.hidden || view.alpha < 0.01) return NO;
-
-    NSString *clsName = NSStringFromClass([view class]);
-    // 绝对保护 Flutter 视图和系统核心容器
-    if ([clsName containsString:@"Flutter"] ||
-        [clsName isEqualToString:@"UILayoutContainerView"] ||
-        [clsName isEqualToString:@"UINavigationTransitionView"] ||
-        [clsName isEqualToString:@"UIViewControllerWrapperView"] ||
-        [clsName isEqualToString:@"UITransitionView"] ||
-        [clsName isEqualToString:@"UIDropShadowView"]) {
-        return NO;
-    }
-
-    // 如果类名直接暴露了 Launch / Splash / Ad
-    if ([clsName containsString:@"Launch"] ||
-        [clsName containsString:@"Splash"] ||
-        [clsName containsString:@"splash"] ||
-        [clsName containsString:@"AdDYCountdown"] ||
-        [clsName containsString:@"Tobid"] ||
-        [clsName containsString:@"WindMill"] ||
-        [clsName containsString:@"CSJ"] ||
-        [clsName containsString:@"BUAd"] ||
-        [clsName containsString:@"GDT"] ||
-        [clsName containsString:@"MSAd"]) {
-        return YES;
-    }
-
-    // 如果这个视图是直接挂在 UIWindow 或根视图上的全屏 View，且它内部没有 Flutter 引擎，只有图片/Label
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    if (view.bounds.size.width >= screenSize.width * 0.85 &&
-        view.bounds.size.height >= screenSize.height * 0.70) {
-        if (!containsMainFlutterOrTab(view)) {
-            // 检查它自身或子视图里有没有大尺寸的 UIImageView（即“大额红包在小蚕”那张背景图）
-            if ([view isKindOfClass:[UIImageView class]]) {
-                return YES;
-            }
-            for (UIView *sub in view.subviews) {
-                if ([sub isKindOfClass:[UIImageView class]] &&
-                    sub.bounds.size.height >= screenSize.height * 0.5) {
-                    return YES;
-                }
-            }
++ (NSTimer *)scheduledTimerWithTimeInterval:(NSTimeInterval)interval repeats:(BOOL)repeats block:(void (^)(NSTimer *timer))block {
+    if (CFAbsoluteTimeGetCurrent() - kAppStartTimestamp < 6.0) {
+        // Swift 常用 block 版 Timer 做开屏 3~8 秒超时兜底
+        if (!repeats && interval >= 1.0 && interval <= 10.0) {
+            interval = 0.01;
         }
     }
-    return NO;
+    return %orig(interval, repeats, block);
 }
 
-// 扫描当前所有 UIWindow，强杀独立广告 adWindow 以及盖在主窗口上的 launchView
-static void purgeAllSplashWindowsAndViews(void) {
-    NSArray<UIWindow *> *windows = xc_allWindows();
-    UIWindow *mainFlutterWindow = nil;
-
-    // 先找到承载 Flutter 主界面的真正主窗口
-    for (UIWindow *win in windows) {
-        if (containsMainFlutterOrTab(win)) {
-            mainFlutterWindow = win;
-            break;
++ (NSTimer *)timerWithTimeInterval:(NSTimeInterval)interval repeats:(BOOL)repeats block:(void (^)(NSTimer *timer))block {
+    if (CFAbsoluteTimeGetCurrent() - kAppStartTimestamp < 6.0) {
+        if (!repeats && interval >= 1.0 && interval <= 10.0) {
+            interval = 0.01;
         }
     }
-
-    for (UIWindow *win in windows) {
-        NSString *winClass = NSStringFromClass([win class]);
-        if ([winClass containsString:@"UITextEffectsWindow"] ||
-            [winClass containsString:@"UIRemoteKeyboardWindow"] ||
-            [winClass containsString:@"UIStatusBarWindow"]) {
-            continue;
-        }
-
-        // 1. 如果已经找到了主窗口，任何其他全屏独立 UIWindow（如 AdSplashWM.adWindow / AdSplashMS.adWindow）全部强行隐藏销毁！
-        if (mainFlutterWindow && win != mainFlutterWindow) {
-            win.hidden = YES;
-            win.alpha = 0.0;
-            win.userInteractionEnabled = NO;
-            win.windowLevel = -1000;
-            win.rootViewController = nil;
-            continue;
-        }
-
-        // 2. 遍历窗口内部的所有直接子视图和根控制器子视图，撕掉 LaunchUtil.launchView 遮罩！
-        for (UIView *sub in [win.subviews copy]) {
-            if (isSplashOrLaunchOverlayView(sub)) {
-                sub.hidden = YES;
-                sub.alpha = 0.0;
-                sub.userInteractionEnabled = NO;
-                [sub removeFromSuperview];
-            }
-        }
-
-        if (win.rootViewController && win.rootViewController.isViewLoaded) {
-            UIView *rootView = win.rootViewController.view;
-            for (UIView *sub in [rootView.subviews copy]) {
-                if (isSplashOrLaunchOverlayView(sub)) {
-                    sub.hidden = YES;
-                    sub.alpha = 0.0;
-                    sub.userInteractionEnabled = NO;
-                    [sub removeFromSuperview];
-                }
-            }
-        }
-    }
-
-    // 3. 直接通过 Swift 运行时查找 xiaocan.LaunchUtil 和 xiaocan.AdManager 单例或 Ivar，强行置空 launchView
-    Class launchUtilCls = objc_getClass("xiaocan.LaunchUtil");
-    if (!launchUtilCls) launchUtilCls = objc_getClass("LaunchUtil");
-    if (launchUtilCls) {
-        // 如果有类方法或共享实例，尝试清理
-    }
+    return %orig(interval, repeats, block);
 }
 
+%end
+
+
 // ============================================================================
-// 4. Hook Swift / ObjC 的 AdManager 与 LaunchUtil 内部实例变量
+// 5. 精准触发开屏关闭回调 + 拦截独立 adWindow（不再粗暴拆子视图，彻底杜绝白屏！）
 // ============================================================================
-__attribute__((unused))
-static void forceClearObjectSplashIvars(id obj) {
+
+// 尝试调用开屏对象的关闭方法或执行其关闭闭包
+static void triggerSplashCloseIfPossible(id obj) {
     if (!obj) return;
-    unsigned int count = 0;
-    Ivar *ivars = class_copyIvarList([obj class], &count);
-    if (!ivars) return;
-
-    for (unsigned int i = 0; i < count; i++) {
-        const char *name = ivar_getName(ivars[i]);
-        if (!name) continue;
-        NSString *ivarName = [NSString stringWithUTF8String:name];
-
-        // 命中 LaunchUtil.$__lazy_storage_$_launchView 或 AdSplash*.adWindow / splashAd
-        if ([ivarName containsString:@"launchView"] ||
-            [ivarName containsString:@"adWindow"] ||
-            [ivarName containsString:@"splashAd"] ||
-            [ivarName containsString:@"splashTobidAd"] ||
-            [ivarName containsString:@"splashBUAd"] ||
-            [ivarName containsString:@"dyCountdownView"]) {
-
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            if (type && type[0] == '@') {
-                id val = object_getIvar(obj, ivars[i]);
-                if (val && [val isKindOfClass:[UIView class]]) {
-                    UIView *v = (UIView *)val;
-                    v.hidden = YES;
-                    v.alpha = 0.0;
-                    v.userInteractionEnabled = NO;
-                    [v removeFromSuperview];
+    
+    // 1. 先把 ignoreSplashAd 和 isClose 设为 YES
+    unsigned int ivarCount = 0;
+    Ivar *ivars = class_copyIvarList([obj class], &ivarCount);
+    if (ivars) {
+        for (unsigned int i = 0; i < ivarCount; i++) {
+            const char *name = ivar_getName(ivars[i]);
+            if (!name) continue;
+            NSString *ivarName = [NSString stringWithUTF8String:name];
+            if ([ivarName containsString:@"ignoreSplashAd"] || [ivarName containsString:@"isClose"]) {
+                const char *type = ivar_getTypeEncoding(ivars[i]);
+                if (type && (strcmp(type, "B") == 0 || strcmp(type, "c") == 0)) {
+                    *((BOOL *)((char *)obj + ivar_getOffset(ivars[i]))) = YES;
                 }
             }
         }
+        free(ivars);
     }
-    free(ivars);
+    
+    // 2. 查找无参数的 close / dismiss / skip / finish 方法并调用
+    unsigned int methodCount = 0;
+    Method *methods = class_copyMethodList([obj class], &methodCount);
+    if (methods) {
+        for (unsigned int i = 0; i < methodCount; i++) {
+            SEL sel = method_getName(methods[i]);
+            NSString *selName = NSStringFromSelector(sel);
+            // 匹配无参数（没有冒号）的关闭方法
+            if (![selName containsString:@":"] &&
+                ([selName containsString:@"close"] ||
+                 [selName containsString:@"Close"] ||
+                 [selName containsString:@"dismiss"] ||
+                 [selName containsString:@"Dismiss"] ||
+                 [selName containsString:@"skip"] ||
+                 [selName containsString:@"Skip"])) {
+                char returnType[32];
+                method_getReturnType(methods[i], returnType, sizeof(returnType));
+                if (strcmp(returnType, "v") == 0) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        ((void (*)(id, SEL))objc_msgSend)(obj, sel);
+                    });
+                }
+            }
+        }
+        free(methods);
+    }
 }
 
+// 拦截独立广告 UIWindow (AdSplashMS / AdSplashWM 的 adWindow)
+%hook UIWindow
+
+- (void)makeKeyAndVisible {
+    NSString *clsName = NSStringFromClass([self class]);
+    NSString *rootVC = self.rootViewController ? NSStringFromClass([self.rootViewController class]) : @"";
+    
+    // 如果这个 Window 是专门为 Splash/Ad 创建的独立窗口，直接拒绝显示！
+    if ([clsName containsString:@"Splash"] || [clsName containsString:@"Ad"] ||
+        [rootVC containsString:@"Splash"] || [rootVC containsString:@"AdSplash"]) {
+        self.hidden = YES;
+        self.alpha = 0.0;
+        self.userInteractionEnabled = NO;
+        return;
+    }
+    %orig;
+}
+
+- (void)setHidden:(BOOL)hidden {
+    if (!hidden) {
+        NSString *clsName = NSStringFromClass([self class]);
+        NSString *rootVC = self.rootViewController ? NSStringFromClass([self.rootViewController class]) : @"";
+        if ([clsName containsString:@"Splash"] || [rootVC containsString:@"Splash"] || [rootVC containsString:@"AdSplash"]) {
+            %orig(YES);
+            return;
+        }
+    }
+    %orig;
+}
+
+%end
+
+// 只针对性隐藏真正的广告视图与 LaunchView，绝不误拆普通 UIView 容器底板（防白屏！）
 %hook UIView
 
 - (void)didMoveToSuperview {
     %orig;
     if (!self.superview) return;
-
-    // 启动前 15 秒内，任何挂载到视图树上的可疑全屏启动图/广告遮罩，当场销毁！
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 15.0) {
-        if (isSplashOrLaunchOverlayView(self)) {
-            self.hidden = YES;
-            self.alpha = 0.0;
-            self.userInteractionEnabled = NO;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self removeFromSuperview];
-            });
-            return;
-        }
-    }
-
-    // 平时浏览时的信息流广告视图拦截
+    
     NSString *clsName = NSStringFromClass([self class]);
-    if ([clsName containsString:@"AdSplash"] ||
+    if (!clsName) return;
+    
+    // 1. 如果是 LaunchView 或 AdSplash 视图，直接隐藏它并触发其控制器的关闭逻辑
+    if ([clsName containsString:@"LaunchView"] ||
+        [clsName containsString:@"AdSplash"] ||
+        [clsName containsString:@"SplashView"] ||
+        [clsName containsString:@"AdDYCountdownView"] ||
         [clsName containsString:@"AdNativeView"] ||
         [clsName containsString:@"OrderAdCell"] ||
         [clsName containsString:@"MineNativeAdCell"] ||
         [clsName containsString:@"HXIconAdView"] ||
-        [clsName containsString:@"LynxTobidFeedAdView"] ||
-        [clsName containsString:@"AdDYCountdownView"]) {
+        [clsName containsString:@"LynxTobidFeedAdView"]) {
+        
         self.hidden = YES;
         self.alpha = 0.0;
         self.userInteractionEnabled = NO;
-        self.frame = CGRectZero;
+        
+        UIResponder *resp = [self nextResponder];
+        while (resp) {
+            NSString *rName = NSStringFromClass([resp class]);
+            if ([rName containsString:@"Launch"] || [rName containsString:@"Splash"] || [rName containsString:@"Ad"]) {
+                triggerSplashCloseIfPossible(resp);
+            }
+            resp = [resp nextResponder];
+        }
+        
         if (![self isKindOfClass:[UITableViewCell class]] && ![self isKindOfClass:[UICollectionViewCell class]]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self removeFromSuperview];
@@ -385,86 +420,60 @@ static void forceClearObjectSplashIvars(id obj) {
     }
 }
 
-- (void)didMoveToWindow {
-    %orig;
-    if (!self.window) return;
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 15.0) {
-        if (isSplashOrLaunchOverlayView(self)) {
-            self.hidden = YES;
-            self.alpha = 0.0;
-            self.userInteractionEnabled = NO;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self removeFromSuperview];
-            });
+%end
+
+// 监控 AdManager / LaunchUtil / AdSplash 初始化，第一时间设置 ignoreSplashAd = YES
+%hook NSObject
+
+- (instancetype)init {
+    id instance = %orig;
+    if (instance) {
+        NSString *clsName = NSStringFromClass([instance class]);
+        if ([clsName hasSuffix:@"AdManager"] ||
+            [clsName hasSuffix:@"LaunchUtil"] ||
+            [clsName containsString:@"AdSplash"] ||
+            [clsName containsString:@"AdForceCloseManager"]) {
+            triggerSplashCloseIfPossible(instance);
         }
     }
+    return instance;
 }
 
 %end
 
-// ============================================================================
-// 5. 彻底禁用 20+ 家三方广告 SDK 的初始化与开屏加载方法 (复刻报告 3.2 节 SDK 方法置空)
-// ============================================================================
-static void nopMethodIMP(id self, SEL _cmd) {
-    // 什么都不做，直接短路返回
-}
 
-static id nilMethodIMP(id self, SEL _cmd) {
-    return nil;
-}
+// ============================================================================
+// 6. 置空 27 个开屏广告类的 load / show 方法 + 禁用摇一摇传感器
+// ============================================================================
+static void emptyVoidIMP(id self, SEL _cmd) {}
+static id emptyNilIMP(id self, SEL _cmd) { return nil; }
 
-static void swizzleAdSDKClasses(void) {
-    NSArray<NSString *> *adSplashClassNames = @[
-        @"XiaoCanAd.AdSplash",
-        @"XiaoCanAd.AdSplashBU",
-        @"XiaoCanAd.AdSplashMS",
-        @"XiaoCanAd.AdSplashWM",
-        @"AdSplash",
-        @"AdSplashBU",
-        @"AdSplashMS",
-        @"AdSplashWM",
-        @"CSJSplashAd",
-        @"BUNativeExpressSplashView",
-        @"ABUSplashAd",
-        @"GDTSplashAd",
-        @"KSSplashAdView",
-        @"BaiduMobAdSplash",
-        @"WindMillSplashAd",
-        @"MSSplashAd",
-        @"BeiZiSplash",
-        @"OctAdSplash",
-        @"QMSplashAd",
-        @"UBiXSplashAd",
-        @"FancySplashAd",
-        @"DM_SplashAd",
-        @"YTSplashAd",
-        @"AdbidSplashAd",
-        @"LMSplashAd",
-        @"AMPSSplashAd",
-        @"AdScopeADNSplashAd"
+static void disableAllSplashSDKMethods(void) {
+    NSArray<NSString *> *splashClasses = @[
+        @"XiaoCanAd.AdSplash", @"XiaoCanAd.AdSplashBU", @"XiaoCanAd.AdSplashMS", @"XiaoCanAd.AdSplashWM",
+        @"AdSplash", @"AdSplashBU", @"AdSplashMS", @"AdSplashWM",
+        @"CSJSplashAd", @"BUNativeExpressSplashView", @"ABUSplashAd", @"GDTSplashAd",
+        @"KSSplashAdView", @"BaiduMobAdSplash", @"WindMillSplashAd", @"MSSplashAd",
+        @"BeiZiSplash", @"OctAdSplash", @"QMSplashAd", @"UBiXSplashAd",
+        @"FancySplashAd", @"DM_SplashAd", @"YTSplashAd", @"AdbidSplashAd",
+        @"LMSplashAd", @"AMPSSplashAd", @"AdScopeADNSplashAd"
     ];
-
-    for (NSString *clsName in adSplashClassNames) {
-        Class cls = NSClassFromString(clsName);
+    
+    for (NSString *name in splashClasses) {
+        Class cls = NSClassFromString(name);
         if (!cls) continue;
-
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(cls, &methodCount);
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
         if (!methods) continue;
-
-        for (unsigned int i = 0; i < methodCount; i++) {
-            SEL sel = method_getName(methods[i]);
-            NSString *selName = NSStringFromSelector(sel);
-            // 凡是 load / show / display 相关方法，全部置空短路！
-            if ([selName containsString:@"load"] ||
-                [selName containsString:@"Load"] ||
-                [selName containsString:@"show"] ||
-                [selName containsString:@"Show"]) {
-                const char *typeEncoding = method_getTypeEncoding(methods[i]);
-                if (typeEncoding && typeEncoding[0] == 'v') {
-                    method_setImplementation(methods[i], (IMP)nopMethodIMP);
-                } else if (typeEncoding && typeEncoding[0] == '@') {
-                    method_setImplementation(methods[i], (IMP)nilMethodIMP);
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+            if ([selName containsString:@"load"] || [selName containsString:@"Load"] ||
+                [selName containsString:@"show"] || [selName containsString:@"Show"]) {
+                const char *enc = method_getTypeEncoding(methods[i]);
+                if (enc && enc[0] == 'v') {
+                    method_setImplementation(methods[i], (IMP)emptyVoidIMP);
+                } else if (enc && enc[0] == '@') {
+                    method_setImplementation(methods[i], (IMP)emptyNilIMP);
                 }
             }
         }
@@ -472,9 +481,6 @@ static void swizzleAdSDKClasses(void) {
     }
 }
 
-// ============================================================================
-// 6. 禁用摇一摇与扭一扭传感器
-// ============================================================================
 %hook CMMotionManager
 - (void)startAccelerometerUpdates {}
 - (void)startAccelerometerUpdatesToQueue:(NSOperationQueue *)queue withHandler:(CMAccelerometerHandler)handler {}
@@ -484,23 +490,13 @@ static void swizzleAdSDKClasses(void) {
 - (void)startDeviceMotionUpdatesToQueue:(NSOperationQueue *)queue withHandler:(CMDeviceMotionHandler)handler {}
 %end
 
-// ============================================================================
-// 7. 入口函数：启动 50ms 高频清理雷达 + 动态库加载监听
-// ============================================================================
 %ctor {
     @autoreleasepool {
-        kAppLaunchTime = CFAbsoluteTimeGetCurrent();
-
-        // 延迟 0.05 秒待所有 Framework 加载完毕后，置空所有广告 SDK 的开屏类方法
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            swizzleAdSDKClasses();
+        kAppStartTimestamp = CFAbsoluteTimeGetCurrent();
+        [NSURLProtocol registerClass:[XCSuperAdBlockProtocol class]];
+        
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            disableAllSplashSDKMethods();
         });
-
-        // 启动前 10 秒内，每 0.05 秒（50毫秒）执行一次全窗口扫描，一旦发现“大额红包”遮罩或独立 adWindow，0.05 秒内立即撕掉！
-        for (int i = 1; i <= 200; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                purgeAllSplashWindowsAndViews();
-            });
-        }
     }
 }
