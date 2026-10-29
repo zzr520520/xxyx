@@ -2,112 +2,126 @@
 #import <UIKit/UIKit.h>
 
 // =========================================================================
-// 1. 业务层：篡改业务网关广告开关 (MatchPlacement -> ad_open: 0)
+// 1. 暴力干掉开屏视图与业务兜底图（见图：大额红包在小蚕）
+// =========================================================================
+%hook UIView
+
+- (void)didMoveToSuperview {
+    %orig;
+    if (self.superview) {
+        NSString *cls = NSStringFromClass([self class]);
+        // 匹配所有带 Splash、Launch、Ad 开头的原生/Flutter容器视图
+        if ([cls localizedCaseInsensitiveContainsString:@"Splash"] ||
+            [cls localizedCaseInsensitiveContainsString:@"LaunchView"] ||
+            [cls localizedCaseInsensitiveContainsString:@"XCAdSplash"] ||
+            [cls localizedCaseInsensitiveContainsString:@"XCSplash"]) {
+
+            self.hidden = YES;
+            self.alpha = 0.0;
+            [self removeFromSuperview];
+        }
+    }
+}
+
+%end
+
+// =========================================================================
+// 2. 强行跳过开屏控制器生命周期 (若有单独的 Controller)
+// =========================================================================
+%hook UIViewController
+
+- (void)viewWillAppear:(BOOL)animated {
+    NSString *cls = NSStringFromClass([self class]);
+    if ([cls localizedCaseInsensitiveContainsString:@"Splash"] ||
+        [cls localizedCaseInsensitiveContainsString:@"Launch"] ||
+        [cls localizedCaseInsensitiveContainsString:@"Advertisement"]) {
+
+        // 瞬间隐藏并关闭该控制器
+        self.view.hidden = YES;
+        [self dismissViewControllerAnimated:NO completion:nil];
+        return;
+    }
+    %orig;
+}
+
+%end
+
+// =========================================================================
+// 3. 熔断倒计时 NSTimer / GCD 延时（解决等 3~5 秒的罪魁祸首）
+// =========================================================================
+%hook NSTimer
+
++ (NSTimer *)scheduledTimerWithTimeInterval:(NSTimeInterval)ti target:(id)aTarget selector:(SEL)aSelector userInfo:(id)userInfo repeats:(BOOL)yesOrNo {
+    NSString *selStr = NSStringFromSelector(aSelector);
+    // 拦截跳过倒计时、闪屏超时定时器
+    if ([selStr localizedCaseInsensitiveContainsString:@"countdown"] ||
+        [selStr localizedCaseInsensitiveContainsString:@"splash"] ||
+        [selStr localizedCaseInsensitiveContainsString:@"timeout"] ||
+        [selStr localizedCaseInsensitiveContainsString:@"dismiss"]) {
+        // 将倒计时直接缩至 0 秒，促使回调立刻触发跳过
+        ti = 0.01;
+    }
+    return %orig(ti, aTarget, aSelector, userInfo, yesOrNo);
+}
+
+%end
+
+// =========================================================================
+// 4. 业务层：彻底关闭业务广告下发 (ad_open = 0)
 // =========================================================================
 %hook NSJSONSerialization
 
 + (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
     id obj = %orig;
-
     if ([obj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)obj;
-        // 匹配业务网关广告配置节点
         if (dict[@"data"] && [dict[@"data"] isKindOfClass:[NSDictionary class]]) {
             NSDictionary *dataDict = dict[@"data"];
-            if (dataDict[@"ad_open"] != nil && [dataDict[@"ad_open"] intValue] == 1) {
-                NSLog(@"[NoSplash] >>> 命中广告点位配置，强制篡改 ad_open = 0");
+            if (dataDict[@"ad_open"] != nil) {
                 NSMutableDictionary *mutableDict = [dict mutableCopy];
                 NSMutableDictionary *mutableData = [dataDict mutableCopy];
-                mutableData[@"ad_open"] = @(0); // 强行关闭开屏开关
+                mutableData[@"ad_open"] = @(0);
                 mutableDict[@"data"] = mutableData;
                 return mutableDict;
             }
         }
     }
-
     return obj;
 }
 
 %end
 
-
 // =========================================================================
-// 2. 传输层：阻断所有导致超时的广告网络连接（直接报失败，0秒快速降级）
+// 5. 阻止各大 SDK 冗余网络阻塞
 // =========================================================================
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
-    NSString *urlString = request.URL.absoluteString;
-
-    // 匹配抓包中所有高延迟或触发超时的广告域名
-    if ([urlString containsString:@"pangolin-sdk"] ||      // 穿山甲 Pangle
-        [urlString containsString:@"sigmob.cn"] ||          // Sigmob / WindMill
-        [urlString containsString:@"mentamob.com"] ||       // 盟推 Menta
-        [urlString containsString:@"adbiding.com"] ||       // 乐盟聚合 Tobid
-        [urlString containsString:@"1rtb.net"] ||           // 美数 MSAdSDK
-        [urlString containsString:@"hubcloud.com.cn"] ||    // 欧克 OctCore
-        [urlString containsString:@"beizi.biz"] ||          // 倍孜 BeiZi
-        [urlString containsString:@"fancyapi.com"] ||       // Fancy RTB
-        [urlString containsString:@"gdt.qq.com"]) {         // 优量汇 GDT
-
-        NSLog(@"[NoSplash] >>> 快速熔断广告请求: %@", urlString);
+    NSString *url = request.URL.absoluteString;
+    if ([url containsString:@"pangolin-sdk"] ||
+        [url containsString:@"sigmob.cn"] ||
+        [url containsString:@"mentamob.com"] ||
+        [url containsString:@"adbiding.com"] ||
+        [url containsString:@"1rtb.net"] ||
+        [url containsString:@"hubcloud.com.cn"] ||
+        [url containsString:@"gdt.qq.com"]) {
 
         if (completionHandler) {
-            // 立即抛出网络不可达错误，促使 SDK 瞬间退出，不再等待 5000ms 超时
-            NSError *error = [NSError errorWithDomain:NSURLErrorDomain
-                                                 code:NSURLErrorCannotConnectToHost
-                                             userInfo:nil];
+            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotConnectToHost userInfo:nil];
             dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler(nil, nil, error);
+                completionHandler(nil, nil, err);
             });
         }
-
-        // 构造一个处于已完成状态的空任务，阻止实际发包
-        NSURLSessionDataTask *dummyTask = %orig(request, nil);
-        [dummyTask cancel];
-        return dummyTask;
+        NSURLSessionDataTask *task = %orig(request, nil);
+        [task cancel];
+        return task;
     }
-
     return %orig;
 }
 
 %end
 
-
-// =========================================================================
-// 3. 注入验证与启动初始化（若注入成功，进入 App 0.5 秒内必弹窗提示）
-// =========================================================================
+// 构造函数不放任何弹窗阻塞，确保静默秒进
 %ctor {
-    @autoreleasepool {
-        NSLog(@"[NoSplash] >>> Dylib 成功载入 Mach-O 二进制！");
-
-        // 延迟 0.5 秒展示弹窗，用于肉眼确认插件是否成功运行
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIWindow *keyWindow = nil;
-            if (@available(iOS 13.0, *)) {
-                for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                    if (scene.activationState == UISceneActivationStateForegroundActive) {
-                        for (UIWindow *w in scene.windows) {
-                            if (w.isKeyWindow) {
-                                keyWindow = w;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if (!keyWindow) {
-                keyWindow = [UIApplication sharedApplication].delegate.window;
-            }
-
-            UIViewController *rootVC = keyWindow.rootViewController;
-            if (rootVC) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"去开屏插件"
-                                                                               message:@"Dylib 注入成功并已生效！"
-                                                                        preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-                [rootVC presentViewController:alert animated:YES completion:nil];
-            }
-        });
-    }
+    // 静默加载
 }
