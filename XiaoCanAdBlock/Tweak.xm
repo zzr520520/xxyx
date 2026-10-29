@@ -68,30 +68,44 @@ static BOOL isOrContainsHomeContent(UIView *view) {
 }
 
 // ============================================================================
-// 1.5 恢复"秒开"的核心：把盖在首页上的"全屏启动容器"藏掉
+// 1.5 恢复"秒开"的核心：只藏"盖在窗口最上层、且不属于首页承载链"的全屏容器
 // ----------------------------------------------------------------------------
-// 只在【首页已经存在】时才动手，且只藏【全屏】兄弟视图：
-//   * 不删除任何视图（removeFromSuperview 会触发 SnapKit 断言闪退）；
-//   * 不动非全屏视图（TabBar、导航栏、小悬浮层都保留 → 不会白屏）；
-//   * 不动含首页内容的视图（Flutter 容器本身不会被动）。
-// 旧版白屏正是因为"隐藏所有非首页兄弟"且"非全屏的也一起藏"，这里把范围收到最小。
+// 2.8.4 白屏复盘：旧的实现会下探 rootViewController.view 内部，把"首页内容容器"
+// 当成非首页全屏层一并藏掉；而"首页已在场"的判断仅靠 UITabBar 类名含 "TabBar"
+// 就成立，所以底部 TabBar 活着、中间内容区全白。
+// 本版规则收紧为一条硬边界：**rootViewController.view 及其整条祖先链一律不碰**，
+// 只在 UIWindow 的直接子视图里，藏全屏且不在该链上的兄弟（即那个启动容器）。
 // ============================================================================
 static void hideFullScreenCoversInWindow(UIWindow *window) {
     if (!window) return;
     if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime > 12.0) return;
-    if (!isOrContainsHomeContent(window)) return; // 首页还没出现就不动手
+    if (!window.rootViewController || !window.rootViewController.isViewLoaded) return;
 
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    NSMutableArray *parents = [NSMutableArray arrayWithObject:window];
-    if (window.rootViewController && window.rootViewController.isViewLoaded) {
-        [parents addObject:window.rootViewController.view];
+    UIView *rootView = window.rootViewController.view;
+    if (!rootView) return;
+
+    // 1. 收集 rootVC.view 的整条承载链（rootVC.view → … → window 的直接子视图）
+    NSMutableArray *chain = [NSMutableArray array];
+    UIView *node = rootView;
+    while (node && node != window) {
+        [chain addObject:node];
+        node = node.superview;
     }
 
-    for (UIView *parent in parents) {
+    // 2. 收集"链上每个节点的父容器" + window 本身，作为可检查的容器
+    NSMutableArray *containers = [NSMutableArray arrayWithObject:window];
+    for (UIView *n in chain) {
+        if (n.superview && ![containers containsObject:n.superview]) {
+            [containers addObject:n.superview];
+        }
+    }
+
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    for (UIView *parent in containers) {
         for (UIView *sub in [parent.subviews copy]) {
-            if (sub == window) continue;
+            if ([chain containsObject:sub]) continue;   // 硬边界：承载链本身一律不碰
             if ([sub isKindOfClass:[UIWindow class]]) continue;
-            if (isOrContainsHomeContent(sub)) continue; // 含首页内容的不动
+            if (isOrContainsHomeContent(sub)) continue; // 含首页内容的不碰
 
             BOOL fullScreen = (sub.bounds.size.width >= screenSize.width * 0.85 &&
                                sub.bounds.size.height >= screenSize.height * 0.65);
