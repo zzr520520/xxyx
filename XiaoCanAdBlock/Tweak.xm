@@ -7,8 +7,14 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <dlfcn.h>
+#import <unistd.h>
+#import <dispatch/dispatch.h>
 
 static CFAbsoluteTime kAppLaunchTime = 0;
+
+// 2.8.7 诊断用：启动期"阻塞原语"的调用次数与累计阻塞秒数（只统计，不改变行为）
+static volatile int    gCntSem = 0, gCntGrp = 0, gCntSlp = 0;
+static volatile double gBlkSem = 0, gBlkGrp = 0, gBlkSlp = 0;
 
 // ============================================================================
 // 2.8.3 找回"秒开"，同时不再动首页
@@ -129,7 +135,7 @@ static void perform_rebinding_with_section(struct rebinding_entry *rebindings, s
     }
 }
 
-static struct rebinding_entry kGlobalRebindings[3];
+static struct rebinding_entry kGlobalRebindings[5];
 static size_t kGlobalRebindingsCount = 0;
 
 static void rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
@@ -232,6 +238,35 @@ static void hooked_dispatch_source_set_timer(dispatch_source_t source, dispatch_
     if (orig_dispatch_source_set_timer) {
         orig_dispatch_source_set_timer(source, start, interval, leeway);
     }
+}
+
+// 2.8.7 诊断：统计主线程在 dispatch_semaphore_wait / dispatch_group_wait 上被阻塞的时长
+// 只计时、不改变等待行为，用来判断"启动慢"到底卡在哪个原语上
+static long (*orig_dispatch_semaphore_wait)(dispatch_semaphore_t dsema, dispatch_time_t timeout) = NULL;
+static long (*orig_dispatch_group_wait)(dispatch_group_t group, dispatch_time_t timeout) = NULL;
+
+static long hooked_dispatch_semaphore_wait(dispatch_semaphore_t dsema, dispatch_time_t timeout) {
+    if (!orig_dispatch_semaphore_wait) return 0;
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0 && [NSThread isMainThread]) {
+        CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
+        long r = orig_dispatch_semaphore_wait(dsema, timeout);
+        gBlkSem += CFAbsoluteTimeGetCurrent() - a;
+        gCntSem++;
+        return r;
+    }
+    return orig_dispatch_semaphore_wait(dsema, timeout);
+}
+
+static long hooked_dispatch_group_wait(dispatch_group_t group, dispatch_time_t timeout) {
+    if (!orig_dispatch_group_wait) return 0;
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0 && [NSThread isMainThread]) {
+        CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
+        long r = orig_dispatch_group_wait(group, timeout);
+        gBlkGrp += CFAbsoluteTimeGetCurrent() - a;
+        gCntGrp++;
+        return r;
+    }
+    return orig_dispatch_group_wait(group, timeout);
 }
 
 // ============================================================================
@@ -436,6 +471,20 @@ static void hooked_dispatch_source_set_timer(dispatch_source_t source, dispatch_
 
 %end
 
+// 2.8.7 诊断：统计 NSThread 睡眠（有些 SDK 用 [NSThread sleepForTimeInterval:] 等待）
+%hook NSThread
++ (void)sleepForTimeInterval:(NSTimeInterval)ti {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0 && [NSThread isMainThread]) {
+        CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
+        %orig(ti);
+        gBlkSlp += CFAbsoluteTimeGetCurrent() - a;
+        gCntSlp++;
+    } else {
+        %orig(ti);
+    }
+}
+%end
+
 
 // ============================================================================
 // 5. 网络层继续保持 100% 拦截所有第三方广告与小蚕 AdMobileService
@@ -534,6 +583,117 @@ static BOOL isXiaoCanAdRPC(NSURLRequest *request) {
 - (void)startDeviceMotionUpdatesToQueue:(NSOperationQueue *)queue withHandler:(CMDeviceMotionHandler)handler {}
 %end
 
+// ============================================================================
+// 6. 启动诊断面层（2.8.7 临时，只看不改）
+// ----------------------------------------------------------------------------
+// 前几版一直在"秒进 / 白屏 / 丢图"之间摇摆，根因始终没坐实。这一版不加任何去广告/
+// 加速功能，只把"启动到底卡在哪"直接画在屏幕上：
+//   (1) t=… bg=… main=…  → bg 一直涨、main 不动 = 主线程被阻塞（卡住）
+//   (2) 每个 UIWindow 的真实类名 / 顶层视图链 / 是否已含首页(Flutter/TabBar/Lynx)
+//   (3) 启动期阻塞原语的调用次数与累计秒数：sem=信号量 grp=DispatchGroup slp=睡眠
+// 请截两张图：约 2 秒时一张、约 5～6 秒时一张。30 秒后自动消失。
+// ============================================================================
+static UIWindow *gDiagWindow = nil;
+static UILabel *gDiagLabel = nil;
+static volatile int gBgTick = 0, gMainTick = 0, gMainPending = 0;
+static volatile BOOL gDiagReady = NO;
+
+static NSString *xcDiagTopChain(UIView *root, int depth) {
+    NSMutableString *chain = [NSMutableString string];
+    UIView *v = root;
+    for (int i = 0; i < depth; i++) {
+        if (v.subviews.count == 0) break;
+        v = v.subviews.lastObject;
+        [chain appendFormat:@"%@>", NSStringFromClass([v class])];
+    }
+    return chain;
+}
+
+static BOOL xcDiagHasHome(UIView *view, int depth) {
+    if (!view || depth > 20) return NO;
+    NSString *cls = NSStringFromClass([view class]);
+    if ([cls containsString:@"Flutter"] || [cls containsString:@"TabBar"] ||
+        [cls containsString:@"WKWebView"] || [cls containsString:@"Lynx"]) {
+        return YES;
+    }
+    for (UIView *sub in view.subviews) {
+        if (xcDiagHasHome(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static NSString *xcDiagText(void) {
+    NSMutableString *s = [NSMutableString string];
+    double el = CFAbsoluteTimeGetCurrent() - kAppLaunchTime;
+    int lag = gBgTick - gMainTick;
+    [s appendFormat:@"t=%.1fs bg=%d main=%d %@\n", el, gBgTick, gMainTick,
+        (lag > 2 ? @"<<主线程被阻塞>>" : @"主线程在跑")];
+    [s appendFormat:@"blk sem=%d(%.1fs) grp=%d(%.1fs) slp=%d(%.1fs)\n",
+        gCntSem, gBlkSem, gCntGrp, gBlkGrp, gCntSlp, gBlkSlp];
+
+    NSArray<UIWindow *> *wins = [UIApplication sharedApplication].windows;
+    [s appendFormat:@"windows=%lu\n", (unsigned long)wins.count];
+    int idx = 0;
+    for (UIWindow *w in wins) {
+        if (idx >= 3) break;
+        NSString *vc = w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"-";
+        [s appendFormat:@"W%d %@ h%d%@\n  vc=%@\n  >%@\n  home=%d\n",
+            idx, NSStringFromClass([w class]), (int)w.hidden,
+            (w.isKeyWindow ? @" KEY" : @""), vc,
+            xcDiagTopChain(w, 5), (int)xcDiagHasHome(w, 0)];
+        idx++;
+    }
+    return s;
+}
+
+static void xcDiagSetup(void) {
+    CGRect scr = [UIScreen mainScreen].bounds;
+    CGFloat h = 340;
+    gDiagWindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 48, scr.size.width, h)];
+    gDiagWindow.windowLevel = UIWindowLevelAlert + 100;
+    gDiagWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.72];
+    gDiagWindow.userInteractionEnabled = NO;
+    UIViewController *vc = [[UIViewController alloc] init];
+    gDiagWindow.rootViewController = vc;
+    gDiagLabel = [[UILabel alloc] initWithFrame:CGRectMake(4, 2, scr.size.width - 8, h - 4)];
+    gDiagLabel.numberOfLines = 0;
+    gDiagLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
+    UIFont *f = [UIFont fontWithName:@"Menlo" size:9.0];
+    gDiagLabel.font = f ?: [UIFont systemFontOfSize:9.0];
+    gDiagLabel.text = @"diag booting...";
+    [vc.view addSubview:gDiagLabel];
+    gDiagWindow.hidden = NO;
+    gDiagReady = YES;
+}
+
+static void xcDiagStart(void) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        for (;;) {
+            usleep(300 * 1000);
+            gBgTick++;
+            // 后台每 0.3s 往主线程塞一次刷新；主线程被阻塞时这里就不会执行 → main 计数停住
+            if (!gMainPending) {
+                gMainPending = 1;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    gMainPending = 0;
+                    gMainTick++;
+                    if (!gDiagReady) {
+                        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                            if (w.isKeyWindow) { xcDiagSetup(); break; }
+                        }
+                    }
+                    if (gDiagReady) gDiagLabel.text = xcDiagText();
+                });
+            }
+            if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime > 30.0) break;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gDiagLabel.hidden = YES;
+            gDiagWindow.hidden = YES;
+        });
+    });
+}
+
 %ctor {
     @autoreleasepool {
         kAppLaunchTime = CFAbsoluteTimeGetCurrent();
@@ -546,8 +706,16 @@ static BOOL isXiaoCanAdRPC(NSURLRequest *request) {
         kGlobalRebindings[0] = (struct rebinding_entry){ "dispatch_after", (void *)hooked_dispatch_after, (void **)&orig_dispatch_after };
         kGlobalRebindings[1] = (struct rebinding_entry){ "dispatch_after_f", (void *)hooked_dispatch_after_f, (void **)&orig_dispatch_after_f };
         kGlobalRebindings[2] = (struct rebinding_entry){ "dispatch_source_set_timer", (void *)hooked_dispatch_source_set_timer, (void **)&orig_dispatch_source_set_timer };
-        kGlobalRebindingsCount = 3;
+        // 3. 诊断：统计（不改变）主线程在信号量/组等待上的阻塞
+        if (!orig_dispatch_semaphore_wait) orig_dispatch_semaphore_wait = (long (*)(dispatch_semaphore_t, dispatch_time_t))dlsym(RTLD_DEFAULT, "dispatch_semaphore_wait");
+        if (!orig_dispatch_group_wait) orig_dispatch_group_wait = (long (*)(dispatch_group_t, dispatch_time_t))dlsym(RTLD_DEFAULT, "dispatch_group_wait");
+        kGlobalRebindings[3] = (struct rebinding_entry){ "dispatch_semaphore_wait", (void *)hooked_dispatch_semaphore_wait, (void **)&orig_dispatch_semaphore_wait };
+        kGlobalRebindings[4] = (struct rebinding_entry){ "dispatch_group_wait", (void *)hooked_dispatch_group_wait, (void **)&orig_dispatch_group_wait };
+        kGlobalRebindingsCount = 5;
 
         _dyld_register_func_for_add_image(rebind_symbols_for_image);
+
+        // 4. 启动诊断面层
+        xcDiagStart();
     }
 }
