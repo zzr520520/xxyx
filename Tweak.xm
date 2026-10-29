@@ -63,8 +63,9 @@
 - (void)layoutSubviews {
     %orig;
     // 将首页底部广告 View 尺寸清零并隐藏
-    self.frame = CGRectZero;
-    self.hidden = YES;
+    // YXHomeRootBottomAdView 仅被 Logos 前向声明，需强转为 UIView 才能访问 frame/hidden
+    [(UIView *)self setFrame:CGRectZero];
+    [(UIView *)self setHidden:YES];
 }
 
 %end
