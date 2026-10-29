@@ -1,0 +1,74 @@
+name: Build Tweak
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip libxml2 libtinfo6 xz-utils
+
+      - name: Cache Theos
+        uses: actions/cache@v4
+        with:
+          path: theos
+          key: theos-${{ runner.os }}-v1
+
+      - name: Install Theos
+        run: |
+          if [ ! -d "$THEOS/makefiles" ]; then
+            git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
+          fi
+          if [ ! -x "$THEOS/toolchain/linux/iphone/bin/clang" ]; then
+            mkdir -p "$THEOS/toolchain"
+            curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
+              | tar -xJ -C "$THEOS/toolchain/"
+          fi
+          echo "$THEOS/toolchain/linux/iphone/bin" >> "$GITHUB_PATH"
+
+      - name: Install iOS SDK
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! ls "$THEOS"/sdks/*.sdk >/dev/null 2>&1; then
+            "$THEOS/bin/install-sdk" latest
+          fi
+
+      - name: Build
+        run: make package
+
+      - name: Show build output
+        run: |
+          ls -lh packages/
+          ls -lh .theos/_/Library/MobileSubstrate/DynamicLibraries/
+          file .theos/_/Library/MobileSubstrate/DynamicLibraries/*.dylib
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: xxyx-deb
+          path: packages/*.deb
+
+      - name: Upload .dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: xxyx-dylib
+          path: .theos/_/Library/MobileSubstrate/DynamicLibraries/
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*.deb
