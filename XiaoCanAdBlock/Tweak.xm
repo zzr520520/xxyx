@@ -7,190 +7,76 @@
 static CFAbsoluteTime kAppLaunchTime = 0;
 
 // ============================================================================
-// 1. 判断某个视图是否是真正的“首页容器”（包含 FlutterView 或 TabBar）
-// 小蚕的首页是 Flutter 引擎渲染的 (FlutterViewController / FlutterView)
+// 2.8.2 修复白屏 / 丢图
+// ----------------------------------------------------------------------------
+// 分析报告结论：
+//   * 开屏是"独立 UIWindow"（AdSplashMS/WM 各自持有 adWindow），不贴在 keyWindow 上；
+//   * App 自带 LaunchUtil.launchView 兜底启动页；
+//   * 参照实现 XCNoAdJump 只做网络拦截 + SDK swizzling + 禁传感器 + 外跳拦截，从不碰视图层。
+// 因此之前那套"任何全屏大图就清空 / 窗口已有首页就丢弃新子视图 / 隐藏所有非首页兄弟"的
+// 广谱启发式，既把首页图片清掉（丢图），又把首页内容容器吞掉（白屏）。本版全部收窄为
+// "精确类名匹配"，只隐藏启动/开屏命名族，绝不动首页。
 // ============================================================================
-static BOOL isOrContainsHomeContent(UIView *view) {
-    if (!view) return NO;
-    NSString *clsName = NSStringFromClass([view class]);
-    if ([clsName containsString:@"Flutter"] || 
-        [clsName containsString:@"TabBar"] ||
-        [clsName containsString:@"WKWebView"]) {
-        return YES;
-    }
-    UIResponder *next = [view nextResponder];
-    if (next && [next isKindOfClass:[UIViewController class]]) {
-        NSString *vcName = NSStringFromClass([next class]);
-        if ([vcName containsString:@"Flutter"] || 
-            [vcName containsString:@"TabBar"] || 
-            [vcName containsString:@"Main"] ||
-            [vcName containsString:@"Home"]) {
+
+// 判断视图自身或任意祖先是否属于"启动页 / 开屏"命名族（精确词，避免误伤首页图片）
+static BOOL isLaunchOrSplashView(UIView *view) {
+    UIView *v = view;
+    int depth = 0;
+    while (v && depth < 12) {
+        NSString *clsName = NSStringFromClass([v class]);
+        if ([clsName containsString:@"Launch"] || [clsName containsString:@"Splash"]) {
             return YES;
         }
-    }
-    for (UIView *sub in view.subviews) {
-        if (isOrContainsHomeContent(sub)) {
-            return YES;
-        }
+        v = v.superview;
+        depth++;
     }
     return NO;
 }
 
 // ============================================================================
-// 2. 第一刀：在本地容器加载启动图片时，直接抹除所有全屏启动大图！
-// 无论它是 LaunchImage、Assets.car 里的本地内置图，还是沙盒缓存的红包图，
-// 只要在启动前 5 秒内尝试往 UIImageView 里塞入全屏尺寸的大图，当场清空！
+// 1. 只清空"启动/开屏容器"里的图，保留秒开，绝不碰首页图片
 // ============================================================================
 %hook UIImageView
 
 - (void)setImage:(UIImage *)image {
-    if (image && (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0)) {
-        CGSize imgSize = image.size;
-        CGSize screenSize = [UIScreen mainScreen].bounds.size;
-        
-        // 判断是否为全屏竖版开屏图/背景图（宽高接近屏幕尺寸，或像素尺寸 >= 600x1000）
-        BOOL isFullScreenImage = (imgSize.width >= screenSize.width * 0.8 && imgSize.height >= screenSize.height * 0.65) ||
-                                 (imgSize.width >= 600 && imgSize.height >= 1000);
-        
-        if (isFullScreenImage && !isOrContainsHomeContent(self)) {
-            // 安全更新：只做透明化隐藏，绝不 removeFromSuperview，避免 SnapKit 布局断言闪退！
-            %orig(nil);
-            self.hidden = YES;
-            self.alpha = 0.0;
-            self.userInteractionEnabled = NO;
-            if (self.superview && !isOrContainsHomeContent(self.superview)) {
-                self.superview.hidden = YES;
-                self.superview.alpha = 0.0;
-                self.superview.userInteractionEnabled = NO;
-            }
-            return;
-        }
+    if (image &&
+        (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) &&
+        isLaunchOrSplashView(self)) {
+        // 只做透明化隐藏，绝不 removeFromSuperview，避免 SnapKit 布局断言闪退
+        %orig(nil);
+        self.hidden = YES;
+        self.alpha = 0.0;
+        self.userInteractionEnabled = NO;
+        return;
     }
     %orig(image);
-}
-
-- (void)layoutSubviews {
-    %orig;
-    // 双重保险：如果 UIImageView 是通过 Storyboard / XIB / Swift 初始化直接赋值的图片（没走 setImage:）
-    if (self.image && (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0)) {
-        CGSize screenSize = [UIScreen mainScreen].bounds.size;
-        if (self.bounds.size.width >= screenSize.width * 0.85 &&
-            self.bounds.size.height >= screenSize.height * 0.65 &&
-            !isOrContainsHomeContent(self)) {
-            
-            self.image = nil;
-            self.hidden = YES;
-            self.alpha = 0.0;
-            self.userInteractionEnabled = NO;
-            
-            // 安全更新：连同装着它的本地容器 View 一起透明化隐藏，绝不 removeFromSuperview！
-            UIView *container = self.superview;
-            if (container && ![container isKindOfClass:[UIWindow class]] && !isOrContainsHomeContent(container)) {
-                container.hidden = YES;
-                container.alpha = 0.0;
-                container.userInteractionEnabled = NO;
-            }
-        }
-    }
 }
 
 %end
 
 
 // ============================================================================
-// 3. 第二刀：直接从 UIWindow 容器中铲除盖在 Flutter 首页上面的本地遮罩层！
-// 报告 5.2 节指出：LaunchUtil.$__lazy_storage_$_launchView 会被加到窗口容器里盖住首页。
-// 我们在 UIWindow 每次布局（layoutSubviews）和添加子视图时，只要看到 Flutter 首页已经存在，
-// 就把所有挡在 FlutterView 上面的遮罩层（无论它叫什么名字）全部当场删除！
+// 2. 开屏窗口：只拦 SDK 自建的 Splash 窗口，不再用宽松的 "Ad" 子串匹配
 // ============================================================================
-static void cleanBlockingContainersInWindow(UIWindow *window) {
-    if (!window) return;
-    
-    // 1. 检查 window 的直接子视图
-    UIView *flutterContainer = nil;
-    for (UIView *sub in window.subviews) {
-        if (isOrContainsHomeContent(sub)) {
-            flutterContainer = sub;
-            break;
-        }
-    }
-    
-    // 如果主窗口里已经有首页容器了，任何排在它后面的全屏遮罩层（就是那个内置启动页容器！）立刻删掉！
-    if (flutterContainer) {
-        for (UIView *sub in [window.subviews copy]) {
-            if (sub != flutterContainer && !isOrContainsHomeContent(sub)) {
-                NSString *clsName = NSStringFromClass([sub class]);
-                if (![clsName hasPrefix:@"_UI"] && ![clsName hasPrefix:@"UITransition"] && ![clsName hasPrefix:@"UILayoutContainer"]) {
-                    sub.hidden = YES;
-                    sub.alpha = 0.0;
-                    sub.userInteractionEnabled = NO;
-                }
-            }
-        }
-    }
-    
-    // 2. 检查 window.rootViewController.view 内部的子视图（防止 LaunchView 是加在 rootVC.view 上的！）
-    if (window.rootViewController && window.rootViewController.isViewLoaded) {
-        UIView *rootView = window.rootViewController.view;
-        UIView *innerFlutter = nil;
-        for (UIView *sub in rootView.subviews) {
-            if (isOrContainsHomeContent(sub)) {
-                innerFlutter = sub;
-                break;
-            }
-        }
-        if (innerFlutter) {
-            for (UIView *sub in [rootView.subviews copy]) {
-                if (sub != innerFlutter && !isOrContainsHomeContent(sub)) {
-                    sub.hidden = YES;
-                    sub.alpha = 0.0;
-                    sub.userInteractionEnabled = NO;
-                }
-            }
-        }
-    }
-}
-
 %hook UIWindow
 
 - (void)addSubview:(UIView *)view {
+    // 关键修复：先正常加入，再按精确类名隐藏；绝不"丢弃"，避免首页子视图被吞掉导致白屏
+    %orig(view);
     if (view && (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0)) {
         NSString *clsName = NSStringFromClass([view class]);
-        // 凡是名字带 Launch / Splash / Ad 的本地容器，直接禁止加进 Window！
-        if ([clsName containsString:@"Launch"] || 
-            [clsName containsString:@"Splash"] || 
-            [clsName containsString:@"AdSplash"]) {
+        if ([clsName containsString:@"Launch"] || [clsName containsString:@"Splash"]) {
             view.hidden = YES;
             view.alpha = 0.0;
-            return;
+            view.userInteractionEnabled = NO;
         }
-        // 如果当前 Window 已经有首页（FlutterView），拒绝任何新的全屏非系统 View 盖上来！
-        if (isOrContainsHomeContent(self) && !isOrContainsHomeContent(view)) {
-            if (![clsName hasPrefix:@"UI"] && ![clsName hasPrefix:@"_UI"]) {
-                view.hidden = YES;
-                view.alpha = 0.0;
-                return;
-            }
-        }
-    }
-    %orig(view);
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) {
-        cleanBlockingContainersInWindow(self);
-    }
-}
-
-- (void)layoutSubviews {
-    %orig;
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) {
-        cleanBlockingContainersInWindow(self);
     }
 }
 
 - (void)makeKeyAndVisible {
     NSString *clsName = NSStringFromClass([self class]);
     NSString *rootVC = self.rootViewController ? NSStringFromClass([self.rootViewController class]) : @"";
-    if ([clsName containsString:@"Splash"] || [clsName containsString:@"Ad"] ||
-        [rootVC containsString:@"Splash"] || [rootVC containsString:@"AdSplash"]) {
+    if ([clsName containsString:@"Splash"] || [rootVC containsString:@"Splash"]) {
         self.hidden = YES;
         self.alpha = 0.0;
         self.userInteractionEnabled = NO;
@@ -203,55 +89,38 @@ static void cleanBlockingContainersInWindow(UIWindow *window) {
 
 
 // ============================================================================
-// 4. 第三刀：如果内置页面是一个独立的 UIViewController 容器，直接跳过它！
+// 3. 启动窗口期内取消过渡动画（秒开），之后恢复原始行为
 // ============================================================================
 %hook UIViewController
 
 - (void)viewWillAppear:(BOOL)animated {
-    %orig(NO); // 启动期取消一切过渡动画，瞬间显现
     if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) {
+        %orig(NO);
         NSString *vcName = NSStringFromClass([self class]);
-        if ([vcName containsString:@"Launch"] || 
-            [vcName containsString:@"Splash"] || 
-            [vcName containsString:@"AdSplash"]) {
+        if ([vcName containsString:@"Launch"] || [vcName containsString:@"Splash"]) {
             self.view.hidden = YES;
             self.view.alpha = 0.0;
-            if (self.presentingViewController) {
-                [self dismissViewControllerAnimated:NO completion:nil];
-            }
         }
+    } else {
+        %orig(animated);
     }
-}
-
-- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
-    if (viewControllerToPresent && (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0)) {
-        NSString *vcName = NSStringFromClass([viewControllerToPresent class]);
-        if ([vcName containsString:@"Launch"] || 
-            [vcName containsString:@"Splash"] || 
-            [vcName containsString:@"Ad"]) {
-            if (completion) completion();
-            return;
-        }
-    }
-    %orig;
 }
 
 %end
 
 
 // ============================================================================
-// 5. 拦截所有 UIView 容器挂载（消灭信息流广告与残余开屏组件）
+// 4. 只按精确类名隐藏已知广告/开屏视图（删除"全屏即隐藏"启发式，避免误伤首页容器）
 // ============================================================================
 %hook UIView
 
 - (void)didMoveToSuperview {
     %orig;
     if (!self.superview) return;
-    
+
     NSString *clsName = NSStringFromClass([self class]);
     if (!clsName) return;
-    
-    // 删掉任何名为 Launch / Splash / Ad 的视图容器
+
     if ([clsName containsString:@"LaunchView"] ||
         [clsName containsString:@"AdSplash"] ||
         [clsName containsString:@"SplashView"] ||
@@ -261,24 +130,10 @@ static void cleanBlockingContainersInWindow(UIWindow *window) {
         [clsName containsString:@"MineNativeAdCell"] ||
         [clsName containsString:@"HXIconAdView"] ||
         [clsName containsString:@"LynxTobidFeedAdView"]) {
-        
+
         self.hidden = YES;
         self.alpha = 0.0;
         self.userInteractionEnabled = NO;
-        return;
-    }
-    
-    // 如果父视图已经包含了 Flutter 首页，绝不允许任何非 Flutter 的全屏容器盖在上面！
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) {
-        CGSize screenSize = [UIScreen mainScreen].bounds.size;
-        if (self.bounds.size.width >= screenSize.width * 0.85 &&
-            self.bounds.size.height >= screenSize.height * 0.65) {
-            if (isOrContainsHomeContent(self.superview) && !isOrContainsHomeContent(self)) {
-                self.hidden = YES;
-                self.alpha = 0.0;
-                self.userInteractionEnabled = NO;
-            }
-        }
     }
 }
 
@@ -286,7 +141,7 @@ static void cleanBlockingContainersInWindow(UIWindow *window) {
 
 
 // ============================================================================
-// 6. 网络层继续保持 100% 拦截所有第三方广告与小蚕 AdMobileService
+// 5. 网络层继续保持 100% 拦截所有第三方广告与小蚕 AdMobileService
 // ============================================================================
 static NSString * const kBlockedAdHosts[] = {
     @"leadmoad.com", @"adbiding.com", @"tobidad.cn", @"tobidad.com",
