@@ -73,4 +73,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: packages/*.deb
+          files: |
+            packages/*.deb
+            .theos/_/Library/MobileSubstrate/DynamicLibraries/XiaoXiaoYouXuanAdBlock.dylib
+            .theos/_/Library/MobileSubstrate/DynamicLibraries/XiaoXiaoYouXuanAdBlock.plist
