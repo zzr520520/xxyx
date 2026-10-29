@@ -53,20 +53,16 @@ static BOOL isOrContainsHomeContent(UIView *view) {
                                  (imgSize.width >= 600 && imgSize.height >= 1000);
         
         if (isFullScreenImage && !isOrContainsHomeContent(self)) {
-            // 直接把图片置空，并把这个图片所在的本地启动容器也一起隐藏删掉！
+            // 安全更新：只做透明化隐藏，绝不 removeFromSuperview，避免 SnapKit 布局断言闪退！
             %orig(nil);
             self.hidden = YES;
             self.alpha = 0.0;
+            self.userInteractionEnabled = NO;
             if (self.superview && !isOrContainsHomeContent(self.superview)) {
                 self.superview.hidden = YES;
                 self.superview.alpha = 0.0;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self.superview removeFromSuperview];
-                });
+                self.superview.userInteractionEnabled = NO;
             }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self removeFromSuperview];
-            });
             return;
         }
     }
@@ -85,15 +81,15 @@ static BOOL isOrContainsHomeContent(UIView *view) {
             self.image = nil;
             self.hidden = YES;
             self.alpha = 0.0;
+            self.userInteractionEnabled = NO;
             
-            // 连同装着它的本地容器 View 一起删掉，绝不留白板！
+            // 安全更新：连同装着它的本地容器 View 一起透明化隐藏，绝不 removeFromSuperview！
             UIView *container = self.superview;
             if (container && ![container isKindOfClass:[UIWindow class]] && !isOrContainsHomeContent(container)) {
                 container.hidden = YES;
                 container.alpha = 0.0;
-                [container removeFromSuperview];
+                container.userInteractionEnabled = NO;
             }
-            [self removeFromSuperview];
         }
     }
 }
@@ -128,7 +124,6 @@ static void cleanBlockingContainersInWindow(UIWindow *window) {
                     sub.hidden = YES;
                     sub.alpha = 0.0;
                     sub.userInteractionEnabled = NO;
-                    [sub removeFromSuperview];
                 }
             }
         }
@@ -150,7 +145,6 @@ static void cleanBlockingContainersInWindow(UIWindow *window) {
                     sub.hidden = YES;
                     sub.alpha = 0.0;
                     sub.userInteractionEnabled = NO;
-                    [sub removeFromSuperview];
                 }
             }
         }
@@ -271,11 +265,6 @@ static void cleanBlockingContainersInWindow(UIWindow *window) {
         self.hidden = YES;
         self.alpha = 0.0;
         self.userInteractionEnabled = NO;
-        if (![self isKindOfClass:[UITableViewCell class]] && ![self isKindOfClass:[UICollectionViewCell class]]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self removeFromSuperview];
-            });
-        }
         return;
     }
     
@@ -288,9 +277,6 @@ static void cleanBlockingContainersInWindow(UIWindow *window) {
                 self.hidden = YES;
                 self.alpha = 0.0;
                 self.userInteractionEnabled = NO;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self removeFromSuperview];
-                });
             }
         }
     }
