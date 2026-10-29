@@ -1,165 +1,152 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-
-// 声明聚合/联盟开屏的 delegate 回调选择器，仅供编译器解析（无运行时实现，不改变原逻辑）
-@interface NSObject (XCAdSplashCallbacks)
-- (void)splashAdFailToPresent:(id)ad withError:(NSError *)error;
-- (void)splashAdDidClose:(id)ad;
-- (void)splashAdClosed:(id)ad;
-@end
 
 // =========================================================================
-// 1. 业务广告服务层：直接伪造网关不开启开屏 (针对 MatchPlacement 接口)
+// 1. 彻底干掉首屏兜底：LaunchUtil / launchView (截图里的“大额红包”)
 // =========================================================================
-%hook NSJSONSerialization
+%hook LaunchUtil
 
-+ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
-    id obj = %orig;
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *dict = (NSDictionary *)obj;
-        // 匹配广告点位下发接口
-        if (dict[@"data"] && [dict[@"data"] isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *dataDict = dict[@"data"];
-            if (dataDict[@"ad_open"] != nil) {
-                NSMutableDictionary *mutableDict = [dict mutableCopy];
-                NSMutableDictionary *mutableData = [dataDict mutableCopy];
-                mutableData[@"ad_open"] = @(0); // 强制声明无广告
-                mutableData[@"ad_source"] = @[];
-                mutableData[@"ios_slot_id"] = @"";
-                mutableDict[@"data"] = mutableData;
-                return mutableDict;
-            }
-        }
+// 拦截获取 launchView，直接返回空或者让其隐藏
+- (id)launchView {
+    UIView *view = %orig;
+    if (view) {
+        view.hidden = YES;
+        view.alpha = 0.0;
     }
-    return obj;
+    return view;
+}
+
+// 如果内部有展示闪屏的方法，直接短路
+- (void)showLaunchView {
+    // 空实现，不展示原生闪屏
+}
+
+- (void)dismissLaunchView {
+    %orig;
 }
 
 %end
 
 
 // =========================================================================
-// 2. 逆向报告 4.4 聚合层拦截：欺骗 Adbid 开屏管理器瞬间完成
+// 2. 核心调度层：强行开启“忽略开屏”开关 (AdManager / SplashModel)
+// =========================================================================
+%hook AdManager
+
+// 报告 5.1 & 5.7：通过 ignoreSplashAd 彻底关停开屏流程
+- (BOOL)ignoreSplashAd {
+    return YES;
+}
+
+// 如果作为属性存在
+- (id)splashModel {
+    id model = %orig;
+    if (model) {
+        @try {
+            [model setValue:@(YES) forKey:@"ignoreSplashAd"];
+            [model setValue:@(0.01) forKey:@"splash_timeout"];
+            [model setValue:@(0.01) forKey:@"splashReqTimeout"];
+        } @catch (NSException *e) {}
+    }
+    return model;
+}
+
+// 拦截准备与加载开屏方法，直接不做任何加载
+- (void)loadSplashAd {
+    // 直接返回，不发起三通道拉取
+}
+
+- (void)showSplashAd {
+    // 直接返回
+}
+
+%end
+
+
+// =========================================================================
+// 3. 报告 5.1：精准打击开屏三通道实现类 (AdSplashWM, AdSplashBU, AdSplashMS)
 // =========================================================================
 
-// Hook 自建聚合核心开屏类
-%hook AdbidSplashAd
+// 通道一：ToBid (WindMill)
+%hook AdSplashWM
 
 - (void)loadAd {
-    // 主动触发加载失败代理，让外层业务直接跳过等待
-    id delegate = [self valueForKey:@"delegate"];
-    if (delegate && [delegate respondsToSelector:@selector(splashAdFailToPresent:withError:)]) {
-        [delegate splashAdFailToPresent:self withError:nil];
+    // 不拉取广告
+}
+
+- (void)showInWindow:(id)arg1 {
+    // 报告 5.1：隐藏持有的 adWindow 并立刻结束
+    UIWindow *win = [self valueForKey:@"adWindow"];
+    if (win) {
+        win.hidden = YES;
     }
 }
 
-- (void)loadAdAndShowInWindow:(id)window {
-    id delegate = [self valueForKey:@"delegate"];
-    if (delegate && [delegate respondsToSelector:@selector(splashAdDidClose:)]) {
-        [delegate splashAdDidClose:self];
-    }
+%end
+
+// 通道二：穿山甲 BU
+%hook AdSplashBU
+
+- (void)loadAd {
 }
 
-- (void)showInWindow:(id)window withBottomView:(id)bottomView {
-    id delegate = [self valueForKey:@"delegate"];
-    if (delegate && [delegate respondsToSelector:@selector(splashAdDidClose:)]) {
-        [delegate splashAdDidClose:self];
-    }
+- (void)showInWindow:(id)arg1 {
 }
 
-- (BOOL)isAdValid {
-    return NO;
+%end
+
+// 通道三：美数 MS
+%hook AdSplashMS
+
+- (void)loadAd {
+}
+
+- (void)showInWindow:(id)arg1 {
+    UIWindow *win = [self valueForKey:@"adWindow"];
+    if (win) {
+        win.hidden = YES;
+    }
 }
 
 %end
 
 
 // =========================================================================
-// 3. 抹掉穿山甲、优量汇、Sigmob、快手等主流联盟的原生开屏加载
+// 4. 报告 5.4：兜底关闭管理器 (AdForceCloseManager)
 // =========================================================================
+%hook AdForceCloseManager
 
-// 穿山甲开屏
-%hook BUSplashAdView
-- (void)loadAdData {
-    id delegate = [self valueForKey:@"delegate"];
-    if (delegate && [delegate respondsToSelector:@selector(splashAdDidClose:)]) {
-        [delegate splashAdDidClose:(id)self];
+// 如果触发了强制兜底，直接执行关闭回调
+- (void)showForceCloseBtnOnView:(id)arg1 {
+    void (^closeBlock)(void) = [self valueForKey:@"closeBack"];
+    if (closeBlock) {
+        closeBlock();
     }
 }
-%end
 
-// 优量汇开屏
-%hook GDTSplashAd
-- (void)loadAdAndShowInWindow:(id)window {
-    id delegate = [self valueForKey:@"delegate"];
-    if (delegate && [delegate respondsToSelector:@selector(splashAdClosed:)]) {
-        [delegate splashAdClosed:self];
-    }
-}
-%end
-
-// Sigmob 开屏
-%hook WindMillSplashAd
-- (void)loadAdAndShow {
-    id delegate = [self valueForKey:@"delegate"];
-    if (delegate && [delegate respondsToSelector:@selector(splashAdClosed:)]) {
-        [delegate splashAdClosed:(id)self];
-    }
-}
-%end
-
-// 快手开屏
-%hook KSAdSplashViewController
-- (void)viewDidLoad {
-    %orig;
-    // 快手控制器直接秒关
-    [self dismissViewControllerAnimated:NO completion:nil];
-}
 %end
 
 
 // =========================================================================
-// 4. 解决 8 秒卡顿的元凶：给网络请求加速降级，严禁让其重试堵塞
+// 5. 独立广告窗口拦截 (防止 AdSplashMS / WM 的 adWindow 盖住主界面)
 // =========================================================================
+%hook UIWindow
 
-%hook NSURLSession
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    NSString *url = request.URL.absoluteString;
-
-    // 只放行业务接口，对第三方竞价、配置、上报做伪造空包快速响应（返回200而不是报错，防止SDK无限卡死重试）
-    if ([url containsString:@"pangolin-sdk"] ||
-        [url containsString:@"sigmob.cn"] ||
-        [url containsString:@"mentamob.com"] ||
-        [url containsString:@"adbiding.com"] ||
-        [url containsString:@"1rtb.net"] ||
-        [url containsString:@"hubcloud.com.cn"] ||
-        [url containsString:@"beizi.biz"] ||
-        [url containsString:@"fancyapi.com"] ||
-        [url containsString:@"gdt.qq.com"]) {
-
-        if (completionHandler) {
-            // 构造假 200 空响应，SDK 认为服务端无广告填充，立刻退出，不再卡 8 秒！
-            NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:request.URL
-                                                                      statusCode:200
-                                                                     HTTPVersion:@"HTTP/1.1"
-                                                                    headerFields:@{@"Content-Type": @"application/json"}];
-            NSData *emptyData = [@"{\"code\":20001,\"data\":\"\",\"msg\":\"no ad\"}" dataUsingEncoding:NSUTF8StringEncoding];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler(emptyData, fakeResp, nil);
-            });
+- (void)makeKeyAndVisible {
+    // 避免非主窗口（开屏独立窗口）抢占焦点
+    if (self != [UIApplication sharedApplication].delegate.window) {
+        NSString *cls = NSStringFromClass([self class]);
+        if ([cls localizedCaseInsensitiveContainsString:@"Splash"] ||
+            [cls localizedCaseInsensitiveContainsString:@"AdWindow"]) {
+            self.hidden = YES;
+            return;
         }
-
-        NSURLSessionDataTask *dummy = %orig(request, nil);
-        [dummy cancel];
-        return dummy;
     }
-
-    return %orig;
+    %orig;
 }
 
 %end
 
-// 静默初始化
 %ctor {
+    // 纯静默载入，零弹窗，零网络死锁风险
 }
