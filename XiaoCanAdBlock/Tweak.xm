@@ -3,6 +3,10 @@
 #import <CoreMotion/CoreMotion.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <dlfcn.h>
 
 static CFAbsoluteTime kAppLaunchTime = 0;
 
@@ -68,53 +72,165 @@ static BOOL isOrContainsHomeContent(UIView *view) {
 }
 
 // ============================================================================
-// 1.5 恢复"秒开"的核心：只藏"盖在窗口最上层、且不属于首页承载链"的全屏容器
+// 1.5 时间加速（视图无关，天然不会白屏）
 // ----------------------------------------------------------------------------
-// 2.8.4 白屏复盘：旧的实现会下探 rootViewController.view 内部，把"首页内容容器"
-// 当成非首页全屏层一并藏掉；而"首页已在场"的判断仅靠 UITabBar 类名含 "TabBar"
-// 就成立，所以底部 TabBar 活着、中间内容区全白。
-// 本版规则收紧为一条硬边界：**rootViewController.view 及其整条祖先链一律不碰**，
-// 只在 UIWindow 的直接子视图里，藏全屏且不在该链上的兄弟（即那个启动容器）。
+// 2.8.4 / 2.8.5 复盘：靠"隐藏窗口兄弟视图"找回秒开，接连误伤首页
+// （内容区全白 → 彻底白屏）。既然视图层不可靠，就改回 2.7.0 的老办法：
+// 不碰任何视图，只把启动期的"等待时间"压掉。用内联 fishhook 改写 Mach-O 的
+// __la_symbol_ptr，劫持：
+//   dispatch_after / dispatch_after_f → Swift 的 asyncAfter(deadline:) 立即执行
+//   dispatch_source_set_timer        → GCD 倒计时瞬间走完
+// 再配合 NSTimer 加速与 UIView 动画归零，开屏停留时间基本归 0。
 // ============================================================================
-static void hideFullScreenCoversInWindow(UIWindow *window) {
-    if (!window) return;
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime > 12.0) return;
-    if (!window.rootViewController || !window.rootViewController.isViewLoaded) return;
+#ifdef __LP64__
+typedef struct mach_header_64 mach_header_t;
+typedef struct segment_command_64 segment_command_t;
+typedef struct section_64 section_t;
+typedef struct nlist_64 nlist_t;
+#define LC_SEGMENT_ARCH_DEPENDENT LC_SEGMENT_64
+#else
+typedef struct mach_header mach_header_t;
+typedef struct segment_command segment_command_t;
+typedef struct section section_t;
+typedef struct nlist nlist_t;
+#define LC_SEGMENT_ARCH_DEPENDENT LC_SEGMENT
+#endif
 
-    UIView *rootView = window.rootViewController.view;
-    if (!rootView) return;
+struct rebinding_entry {
+    const char *name;
+    void *replacement;
+    void **replaced;
+};
 
-    // 1. 收集 rootVC.view 的整条承载链（rootVC.view → … → window 的直接子视图）
-    NSMutableArray *chain = [NSMutableArray array];
-    UIView *node = rootView;
-    while (node && node != window) {
-        [chain addObject:node];
-        node = node.superview;
-    }
-
-    // 2. 收集"链上每个节点的父容器" + window 本身，作为可检查的容器
-    NSMutableArray *containers = [NSMutableArray arrayWithObject:window];
-    for (UIView *n in chain) {
-        if (n.superview && ![containers containsObject:n.superview]) {
-            [containers addObject:n.superview];
+static void perform_rebinding_with_section(struct rebinding_entry *rebindings, size_t rebindings_nel,
+                                           section_t *section, intptr_t slide,
+                                           nlist_t *symtab, char *strtab, uint32_t *indirect_symtab) {
+    uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
+    void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+    for (uint i = 0; i < section->size / sizeof(void *); i++) {
+        uint32_t symtab_index = indirect_symbol_indices[i];
+        if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
+            symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
+            continue;
         }
-    }
+        uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
+        char *symbol_name = strtab + strtab_offset;
+        if (symbol_name[0] == '\0') continue;
 
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    for (UIView *parent in containers) {
-        for (UIView *sub in [parent.subviews copy]) {
-            if ([chain containsObject:sub]) continue;   // 硬边界：承载链本身一律不碰
-            if ([sub isKindOfClass:[UIWindow class]]) continue;
-            if (isOrContainsHomeContent(sub)) continue; // 含首页内容的不碰
-
-            BOOL fullScreen = (sub.bounds.size.width >= screenSize.width * 0.85 &&
-                               sub.bounds.size.height >= screenSize.height * 0.65);
-            if (fullScreen) {
-                sub.hidden = YES;
-                sub.alpha = 0.0;
-                sub.userInteractionEnabled = NO;
+        for (size_t j = 0; j < rebindings_nel; j++) {
+            if (strcmp(&symbol_name[1], rebindings[j].name) == 0) {
+                if (rebindings[j].replaced != NULL && *rebindings[j].replaced == NULL) {
+                    *rebindings[j].replaced = indirect_symbol_bindings[i];
+                }
+                indirect_symbol_bindings[i] = rebindings[j].replacement;
+                break;
             }
         }
+    }
+}
+
+static struct rebinding_entry kGlobalRebindings[3];
+static size_t kGlobalRebindingsCount = 0;
+
+static void rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
+    if (kGlobalRebindingsCount == 0) return;
+
+    Dl_info info;
+    if (dladdr(header, &info) == 0) return;
+    // 只重绑定主程序与 Swift 的 GCD 桥接库，绝不碰系统底层框架
+    if (info.dli_fname && strstr(info.dli_fname, "/System/Library/") != NULL) {
+        if (strstr(info.dli_fname, "libswift") == NULL) {
+            return;
+        }
+    }
+
+    segment_command_t *cur_seg_cmd;
+    segment_command_t *linkedit_segment = NULL;
+    struct symtab_command *symtab_cmd = NULL;
+    struct dysymtab_command *dysymtab_cmd = NULL;
+
+    uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
+        cur_seg_cmd = (segment_command_t *)cur;
+        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
+            if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
+                linkedit_segment = cur_seg_cmd;
+            }
+        } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
+            symtab_cmd = (struct symtab_command *)cur_seg_cmd;
+        } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
+            dysymtab_cmd = (struct dysymtab_command *)cur_seg_cmd;
+        }
+    }
+
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment || !dysymtab_cmd->nindirectsyms) return;
+
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
+    nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
+    char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
+    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+    cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
+        cur_seg_cmd = (segment_command_t *)cur;
+        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
+            if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
+                strcmp(cur_seg_cmd->segname, "__DATA_CONST") != 0) {
+                continue;
+            }
+            for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
+                section_t *sect = (section_t *)(cur + sizeof(segment_command_t)) + j;
+                if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
+                    perform_rebinding_with_section(kGlobalRebindings, kGlobalRebindingsCount, sect, slide, symtab, strtab, indirect_symtab);
+                }
+            }
+        }
+    }
+}
+
+static void (*orig_dispatch_after)(dispatch_time_t when, dispatch_queue_t queue, dispatch_block_t block) = NULL;
+static void (*orig_dispatch_after_f)(dispatch_time_t when, dispatch_queue_t queue, void *context, dispatch_function_t work) = NULL;
+static void (*orig_dispatch_source_set_timer)(dispatch_source_t source, dispatch_time_t start, uint64_t interval, uint64_t leeway) = NULL;
+
+static void hooked_dispatch_after(dispatch_time_t when, dispatch_queue_t queue, dispatch_block_t block) {
+    // 启动前 4.5 秒内，主线程上 >0.15s 的延迟任务（开屏停留/闪屏等待）直接压到 1 毫秒
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 4.5 && queue == dispatch_get_main_queue()) {
+        dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
+        if (when > now + (int64_t)(0.15 * NSEC_PER_SEC)) {
+            when = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.001 * NSEC_PER_SEC));
+        }
+    }
+    if (orig_dispatch_after) {
+        orig_dispatch_after(when, queue, block);
+    }
+}
+
+static void hooked_dispatch_after_f(dispatch_time_t when, dispatch_queue_t queue, void *context, dispatch_function_t work) {
+    // Swift 的 DispatchQueue.main.asyncAfter 走这里
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 4.5 && queue == dispatch_get_main_queue()) {
+        dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
+        if (when > now + (int64_t)(0.15 * NSEC_PER_SEC)) {
+            when = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.001 * NSEC_PER_SEC));
+        }
+    }
+    if (orig_dispatch_after_f) {
+        orig_dispatch_after_f(when, queue, context, work);
+    }
+}
+
+static void hooked_dispatch_source_set_timer(dispatch_source_t source, dispatch_time_t start, uint64_t interval, uint64_t leeway) {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 4.5) {
+        dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
+        if (start > now + (int64_t)(0.15 * NSEC_PER_SEC)) {
+            start = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.001 * NSEC_PER_SEC));
+        }
+        // 1 秒 1 次的开屏倒计时 → 0.01 秒 1 次，5 秒倒计时瞬间走完
+        if (interval >= (uint64_t)(0.5 * NSEC_PER_SEC) && interval <= (uint64_t)(10.0 * NSEC_PER_SEC)) {
+            interval = (uint64_t)(0.01 * NSEC_PER_SEC);
+        }
+    }
+    if (orig_dispatch_source_set_timer) {
+        orig_dispatch_source_set_timer(source, start, interval, leeway);
     }
 }
 
@@ -181,15 +297,6 @@ static void hideFullScreenCoversInWindow(UIWindow *window) {
             view.alpha = 0.0;
             view.userInteractionEnabled = NO;
         }
-        // 首页已在场时，把后来盖上的全屏启动容器藏掉（秒开核心）
-        hideFullScreenCoversInWindow(self);
-    }
-}
-
-- (void)layoutSubviews {
-    %orig;
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0) {
-        hideFullScreenCoversInWindow(self);
     }
 }
 
@@ -216,11 +323,10 @@ static void hideFullScreenCoversInWindow(UIWindow *window) {
 - (void)viewWillAppear:(BOOL)animated {
     NSString *vcName = NSStringFromClass([self class]);
 
-    // 首页控制器出现 → 永久关闭清图逻辑，并立刻扫一遍窗口
+    // 首页控制器出现 → 永久关闭清图逻辑（不再触碰任何视图）
     if ([vcName containsString:@"Flutter"] || [vcName containsString:@"Main"] ||
         [vcName containsString:@"Home"] || [vcName containsString:@"TabBar"]) {
         gHomeMounted = YES;
-        hideFullScreenCoversInWindow(self.view.window);
     }
 
     if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) {
@@ -249,12 +355,11 @@ static void hideFullScreenCoversInWindow(UIWindow *window) {
     NSString *clsName = NSStringFromClass([self class]);
     if (!clsName) return;
 
-    // 首页视图（Flutter/TabBar/WKWebView）挂载 → 永久关闭清图逻辑，并立刻扫一遍窗口
+    // 首页视图（Flutter/TabBar/WKWebView）挂载 → 永久关闭清图逻辑（不再触碰任何视图）
     if ([clsName containsString:@"Flutter"] ||
         [clsName containsString:@"TabBar"] ||
         [clsName containsString:@"WKWebView"]) {
         gHomeMounted = YES;
-        hideFullScreenCoversInWindow(self.window);
     }
 
     if ([clsName containsString:@"LaunchView"] ||
@@ -271,6 +376,62 @@ static void hideFullScreenCoversInWindow(UIWindow *window) {
         self.alpha = 0.0;
         self.userInteractionEnabled = NO;
     }
+}
+
+%end
+
+
+// ============================================================================
+// 4.5 时间加速（二）：NSTimer 加速 + 启动期动画归零
+// 视图层完全不改，只压缩"等待"本身
+// ============================================================================
+%hook NSTimer
+
++ (NSTimer *)scheduledTimerWithTimeInterval:(NSTimeInterval)ti target:(id)aTarget selector:(SEL)aSelector userInfo:(id)userInfo repeats:(BOOL)yesOrNo {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0 && ti >= 0.2 && ti <= 15.0) {
+        ti = 0.005;
+    }
+    return %orig(ti, aTarget, aSelector, userInfo, yesOrNo);
+}
+
++ (NSTimer *)scheduledTimerWithTimeInterval:(NSTimeInterval)interval repeats:(BOOL)repeats block:(void (^)(NSTimer *timer))block {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0 && interval >= 0.2 && interval <= 15.0) {
+        interval = 0.005;
+    }
+    return %orig(interval, repeats, block);
+}
+
++ (NSTimer *)timerWithTimeInterval:(NSTimeInterval)interval repeats:(BOOL)repeats block:(void (^)(NSTimer *timer))block {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0 && interval >= 0.2 && interval <= 15.0) {
+        interval = 0.005;
+    }
+    return %orig(interval, repeats, block);
+}
+
++ (NSTimer *)timerWithTimeInterval:(NSTimeInterval)ti target:(id)aTarget selector:(SEL)aSelector userInfo:(id)userInfo repeats:(BOOL)yesOrNo {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0 && ti >= 0.2 && ti <= 15.0) {
+        ti = 0.005;
+    }
+    return %orig(ti, aTarget, aSelector, userInfo, yesOrNo);
+}
+
+%end
+
+%hook UIView
+
++ (void)animateWithDuration:(NSTimeInterval)duration animations:(void (^)(void))animations completion:(void (^)(BOOL finished))completion {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0) {
+        duration = 0.0;
+    }
+    %orig(duration, animations, completion);
+}
+
++ (void)animateWithDuration:(NSTimeInterval)duration delay:(NSTimeInterval)delay options:(UIViewAnimationOptions)options animations:(void (^)(void))animations completion:(void (^)(BOOL finished))completion {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 5.0) {
+        duration = 0.0;
+        delay = 0.0;
+    }
+    %orig(duration, delay, options, animations, completion);
 }
 
 %end
@@ -376,6 +537,17 @@ static BOOL isXiaoCanAdRPC(NSURLRequest *request) {
 %ctor {
     @autoreleasepool {
         kAppLaunchTime = CFAbsoluteTimeGetCurrent();
+
+        // 1. 注册网络协议拦截器
         [NSURLProtocol registerClass:[XCFastAdBlockProtocol class]];
+
+        // 2. 内联 fishhook：重绑定主程序与 Swift 库里的 dispatch_after / dispatch_after_f /
+        //    dispatch_source_set_timer，把启动期的等待时间压到 1 毫秒
+        kGlobalRebindings[0] = (struct rebinding_entry){ "dispatch_after", (void *)hooked_dispatch_after, (void **)&orig_dispatch_after };
+        kGlobalRebindings[1] = (struct rebinding_entry){ "dispatch_after_f", (void *)hooked_dispatch_after_f, (void **)&orig_dispatch_after_f };
+        kGlobalRebindings[2] = (struct rebinding_entry){ "dispatch_source_set_timer", (void *)hooked_dispatch_source_set_timer, (void **)&orig_dispatch_source_set_timer };
+        kGlobalRebindingsCount = 3;
+
+        _dyld_register_func_for_add_image(rebind_symbols_for_image);
     }
 }
