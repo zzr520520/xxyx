@@ -1,9 +1,0 @@
-Package: com.yourname.xiaoxiaoyouxuanadblock
-Name: 晓晓优选去广告与开屏秒进
-Depends: mobilesubstrate (>= 0.9.5000)
-Version: 1.2.0
-Architecture: iphoneos-arm
-Description: 深度去除晓晓优选开屏及信息流广告，实现秒进 APP。
-Maintainer: YourName
-Author: YourName
-Section: Tweaks

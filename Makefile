@@ -3,7 +3,7 @@ TARGET = iphone:clang:latest:14.0
 THEOS_DEVICE_IP = localhost
 THEOS_DEVICE_PORT = 22222
 
-SUBPROJECTS = XiaoXiaoYouXuanAdBlock XiaoCanAdBlock
+SUBPROJECTS = XiaoCanAdBlock
 
 .PHONY: all package clean $(SUBPROJECTS)
 
