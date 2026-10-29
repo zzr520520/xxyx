@@ -68,6 +68,43 @@ static BOOL isOrContainsHomeContent(UIView *view) {
 }
 
 // ============================================================================
+// 1.5 恢复"秒开"的核心：把盖在首页上的"全屏启动容器"藏掉
+// ----------------------------------------------------------------------------
+// 只在【首页已经存在】时才动手，且只藏【全屏】兄弟视图：
+//   * 不删除任何视图（removeFromSuperview 会触发 SnapKit 断言闪退）；
+//   * 不动非全屏视图（TabBar、导航栏、小悬浮层都保留 → 不会白屏）；
+//   * 不动含首页内容的视图（Flutter 容器本身不会被动）。
+// 旧版白屏正是因为"隐藏所有非首页兄弟"且"非全屏的也一起藏"，这里把范围收到最小。
+// ============================================================================
+static void hideFullScreenCoversInWindow(UIWindow *window) {
+    if (!window) return;
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime > 12.0) return;
+    if (!isOrContainsHomeContent(window)) return; // 首页还没出现就不动手
+
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    NSMutableArray *parents = [NSMutableArray arrayWithObject:window];
+    if (window.rootViewController && window.rootViewController.isViewLoaded) {
+        [parents addObject:window.rootViewController.view];
+    }
+
+    for (UIView *parent in parents) {
+        for (UIView *sub in [parent.subviews copy]) {
+            if (sub == window) continue;
+            if ([sub isKindOfClass:[UIWindow class]]) continue;
+            if (isOrContainsHomeContent(sub)) continue; // 含首页内容的不动
+
+            BOOL fullScreen = (sub.bounds.size.width >= screenSize.width * 0.85 &&
+                               sub.bounds.size.height >= screenSize.height * 0.65);
+            if (fullScreen) {
+                sub.hidden = YES;
+                sub.alpha = 0.0;
+                sub.userInteractionEnabled = NO;
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 1. 清空"启动大图"以恢复秒开；首页一挂载就永久停手，绝不碰首页图片
 // ============================================================================
 %hook UIImageView
@@ -123,13 +160,22 @@ static BOOL isOrContainsHomeContent(UIView *view) {
 - (void)addSubview:(UIView *)view {
     // 关键修复：先正常加入，再按精确类名隐藏；绝不"丢弃"，避免首页子视图被吞掉导致白屏
     %orig(view);
-    if (view && (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0)) {
+    if (view && (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0)) {
         NSString *clsName = NSStringFromClass([view class]);
         if ([clsName containsString:@"Launch"] || [clsName containsString:@"Splash"]) {
             view.hidden = YES;
             view.alpha = 0.0;
             view.userInteractionEnabled = NO;
         }
+        // 首页已在场时，把后来盖上的全屏启动容器藏掉（秒开核心）
+        hideFullScreenCoversInWindow(self);
+    }
+}
+
+- (void)layoutSubviews {
+    %orig;
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0) {
+        hideFullScreenCoversInWindow(self);
     }
 }
 
@@ -156,10 +202,11 @@ static BOOL isOrContainsHomeContent(UIView *view) {
 - (void)viewWillAppear:(BOOL)animated {
     NSString *vcName = NSStringFromClass([self class]);
 
-    // 首页控制器出现 → 永久关闭清图逻辑，之后绝不再碰任何图片
+    // 首页控制器出现 → 永久关闭清图逻辑，并立刻扫一遍窗口
     if ([vcName containsString:@"Flutter"] || [vcName containsString:@"Main"] ||
         [vcName containsString:@"Home"] || [vcName containsString:@"TabBar"]) {
         gHomeMounted = YES;
+        hideFullScreenCoversInWindow(self.view.window);
     }
 
     if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) {
@@ -188,11 +235,12 @@ static BOOL isOrContainsHomeContent(UIView *view) {
     NSString *clsName = NSStringFromClass([self class]);
     if (!clsName) return;
 
-    // 首页视图（Flutter/TabBar/WKWebView）挂载 → 永久关闭清图逻辑
+    // 首页视图（Flutter/TabBar/WKWebView）挂载 → 永久关闭清图逻辑，并立刻扫一遍窗口
     if ([clsName containsString:@"Flutter"] ||
         [clsName containsString:@"TabBar"] ||
         [clsName containsString:@"WKWebView"]) {
         gHomeMounted = YES;
+        hideFullScreenCoversInWindow(self.window);
     }
 
     if ([clsName containsString:@"LaunchView"] ||
