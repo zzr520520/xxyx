@@ -54,6 +54,16 @@ jobs:
       - name: Show build output
         run: ls -l dist/
 
+      # 每次构建都刷新一个滚动版本，保证 dylib 始终可从构建流直接下载（非 zip）
+      - name: Publish rolling latest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest build
+          prerelease: true
+          files: |
+            dist/*.dylib
+
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
