@@ -1,102 +1,48 @@
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 
-// UIWindow 私有方法声明（供 Logos 解析 %orig）
-@interface UIWindow (XiaoCanPrivate)
-- (BOOL)_isConstrainedByScreenBounds;
-@end
+// 1. Hook 核心聚合 SDK: AdbidSplashAd
+%hook AdbidSplashAd
 
-// ============================================================================
-// 1. 强力劫持网关广告配置响应：将所有开屏广告开关全部置零 (ad_open: 0)
-// ============================================================================
-%hook NSDictionary
+// 阻止开屏加载，防止后台发起耗时网络请求与竞价
+- (void)loadAd {
+    // 直接不执行原逻辑，或模拟失败以跳过等待
+    NSLog(@"[NoSplash] AdbidSplashAd loadAd blocked.");
+}
 
-- (id)objectForKey:(id)aKey {
-    id val = %orig;
-    // 拦截小蚕网关返回的广告配置字段，强制关闭开屏
-    if ([aKey isKindOfClass:[NSString class]]) {
-        NSString *keyStr = (NSString *)aKey;
-        if ([keyStr isEqualToString:@"ad_open"] || [keyStr isEqualToString:@"is_appopen_lb"]) {
-            return @0; // 强制设为关闭
-        }
-    }
-    return val;
+// 阻止广告展示到主 Window
+- (void)showAd:(id)arg1 {
+    NSLog(@"[NoSplash] AdbidSplashAd showAd blocked.");
+}
+
+- (void)showInWindow:(UIWindow *)window withBottomView:(UIView *)bottomView {
+    NSLog(@"[NoSplash] AdbidSplashAd showInWindow blocked.");
+    // 如果业务层依赖 delegate 通知关闭，可主动触发 dismiss/finish 相关的 delegate 方法
 }
 
 %end
 
-
-// ============================================================================
-// 2. 暴力秒进：全方位拦截并销毁所有开屏控制器与启动动画视图
-// ============================================================================
-%hook UIViewController
-
-- (void)viewDidLoad {
-    %orig;
-    NSString *className = NSStringFromClass([self class]);
-    if (!className) return;
-
-    // 过滤并精准打击所有包含 Splash、Launch、AdOpen 或广告相关的控制器
-    if ([className containsString:@"Splash"] ||
-        [className containsString:@"splash"] ||
-        [className containsString:@"AppOpen"] ||
-        [className containsString:@"AdOpen"] ||
-        [className containsString:@"LaunchAd"]) {
-
-        NSLog(@">>> [XiaoCanInstant] 捕获到开屏/广告控制器: %@", className);
-
-        // 瞬间清空视图并移除
-        self.view.hidden = YES;
-        self.view.alpha = 0.0;
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.presentingViewController) {
-                [self dismissViewControllerAnimated:NO completion:nil];
-            }
-            [self.view removeFromSuperview];
-            [self removeFromParentViewController];
-        });
-    }
+// 2. 兜底 Hook：穿山甲 CSJ 开屏视图
+%hook BUSplashAdView
+- (id)initWithSlot:(id)arg1 frame:(CGRect)arg2 {
+    NSLog(@"[NoSplash] BUSplashAdView blocked.");
+    return nil;
 }
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    NSString *className = NSStringFromClass([self class]);
-    if (!className) return;
-
-    if ([className containsString:@"Splash"] || [className containsString:@"splash"] || [className containsString:@"AppOpen"]) {
-        // 再次尝试通过常见选择器强行关闭
-        NSArray *actions = @[@"skipAction", @"closeAction", @"dismissAction", @"splashDidClose"];
-        for (NSString *actionStr in actions) {
-            SEL sel = NSSelectorFromString(actionStr);
-            if ([self respondsToSelector:sel]) {
-                ((void (*)(id, SEL))objc_msgSend)(self, sel);
-            }
-        }
-    }
-}
-
 %end
 
-
-// ============================================================================
-// 3. 根视图与广告窗口拦截：防止本地静态开屏图残留
-// ============================================================================
-%hook UIWindow
-
-- (BOOL)_isConstrainedByScreenBounds {
-    return %orig;
+// 3. 兜底 Hook：优量汇 GDTSplashAd
+%hook GDTSplashAd
+- (void)loadAdAndShowInWindow:(UIWindow *)window {
+    NSLog(@"[NoSplash] GDTSplashAd blocked.");
 }
-
-- (void)makeKeyAndVisible {
-    %orig;
-    // 检查是否是广告独立悬浮 Window，如果是则直接隐藏
-    NSString *windowClassName = NSStringFromClass([self class]);
-    if ([windowClassName containsString:@"Ad"] || [windowClassName containsString:@"Splash"]) {
-        self.hidden = YES;
-    }
+- (void)showAdInWindow:(UIWindow *)window withBottomView:(UIView *)bottomView {
+    NSLog(@"[NoSplash] GDTSplashAd show blocked.");
 }
+%end
 
+// 4. 处理 App 自身的开屏 ViewController 或倒计时 Window
+// 小蚕惠生活在主入口会有广告承载控制器，如果发现界面依然存在倒计时容器：
+%hook XCFoundation // 或对应的业务开屏容器类
+// 如果找到承载广告的 VC，重写其 viewDidLoad 或 viewWillAppear，让其直接 dismiss 或切换到 TabBarVC
 %end
