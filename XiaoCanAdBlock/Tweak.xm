@@ -2,47 +2,152 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-// 1. Hook 核心聚合 SDK: AdbidSplashAd
+// 辅助打印日志宏
+#define XCLog(fmt, ...) NSLog((@"[NoSplashHook] " fmt), ##__VA_ARGS__)
+
+// =========================================================================
+// 策略 1：拦截通用广告开屏管理器与代理回调（防止业务逻辑被挂起）
+// =========================================================================
+
+// 1. Hook 聚合层开屏管理类 AdbidSplashAd
 %hook AdbidSplashAd
 
-// 阻止开屏加载，防止后台发起耗时网络请求与竞价
 - (void)loadAd {
-    // 直接不执行原逻辑，或模拟失败以跳过等待
-    NSLog(@"[NoSplash] AdbidSplashAd loadAd blocked.");
+    XCLog(@"Intercepted AdbidSplashAd loadAd");
+    // 不执行原网络请求，尝试通知代理已失败或关闭，驱动业务进入主流程
+    id delegate = [self valueForKey:@"delegate"];
+    if (delegate) {
+        if ([delegate respondsToSelector:@selector(splashAdFailToPresent:error:)]) {
+            [delegate performSelector:@selector(splashAdFailToPresent:error:) withObject:self withObject:nil];
+        } else if ([delegate respondsToSelector:@selector(splashAdDidClose:)]) {
+            [delegate performSelector:@selector(splashAdDidClose:) withObject:self];
+        }
+    }
 }
 
-// 阻止广告展示到主 Window
 - (void)showAd:(id)arg1 {
-    NSLog(@"[NoSplash] AdbidSplashAd showAd blocked.");
+    XCLog(@"Intercepted AdbidSplashAd showAd:");
 }
 
 - (void)showInWindow:(UIWindow *)window withBottomView:(UIView *)bottomView {
-    NSLog(@"[NoSplash] AdbidSplashAd showInWindow blocked.");
-    // 如果业务层依赖 delegate 通知关闭，可主动触发 dismiss/finish 相关的 delegate 方法
+    XCLog(@"Intercepted AdbidSplashAd showInWindow:withBottomView:");
+    // 如果页面正在等待代理关闭回调，主动唤起关闭
+    id delegate = [self valueForKey:@"delegate"];
+    if (delegate && [delegate respondsToSelector:@selector(splashAdDidClose:)]) {
+        [delegate performSelector:@selector(splashAdDidClose:) withObject:self];
+    }
 }
 
 %end
 
-// 2. 兜底 Hook：穿山甲 CSJ 开屏视图
+// 2. Hook 穿山甲开屏核心类
 %hook BUSplashAdView
-- (id)initWithSlot:(id)arg1 frame:(CGRect)arg2 {
-    NSLog(@"[NoSplash] BUSplashAdView blocked.");
-    return nil;
+- (void)loadAdData {
+    XCLog(@"Intercepted BUSplashAdView loadAdData");
+    id delegate = [self valueForKey:@"delegate"];
+    if (delegate && [delegate respondsToSelector:@selector(splashAdDidClose:)]) {
+        [delegate performSelector:@selector(splashAdDidClose:) withObject:self];
+    }
 }
 %end
 
-// 3. 兜底 Hook：优量汇 GDTSplashAd
+// 3. Hook 优量汇开屏核心类
 %hook GDTSplashAd
-- (void)loadAdAndShowInWindow:(UIWindow *)window {
-    NSLog(@"[NoSplash] GDTSplashAd blocked.");
-}
-- (void)showAdInWindow:(UIWindow *)window withBottomView:(UIView *)bottomView {
-    NSLog(@"[NoSplash] GDTSplashAd show blocked.");
+- (void)loadAdAndShowInWindow:(id)window {
+    XCLog(@"Intercepted GDTSplashAd loadAdAndShowInWindow:");
+    id delegate = [self valueForKey:@"delegate"];
+    if (delegate && [delegate respondsToSelector:@selector(splashAdClosed:)]) {
+        [delegate performSelector:@selector(splashAdClosed:) withObject:self];
+    }
 }
 %end
 
-// 4. 处理 App 自身的开屏 ViewController 或倒计时 Window
-// 小蚕惠生活在主入口会有广告承载控制器，如果发现界面依然存在倒计时容器：
-%hook XCFoundation // 或对应的业务开屏容器类
-// 如果找到承载广告的 VC，重写其 viewDidLoad 或 viewWillAppear，让其直接 dismiss 或切换到 TabBarVC
+
+// =========================================================================
+// 策略 2：UI 容器层兜底 —— 强行跳过开屏 ViewController / 自动点击跳过
+// =========================================================================
+
+// 监听所有 Controller 的展示，若为开屏/广告类控制器，直接 dismiss 或切换
+%hook UIViewController
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+
+    NSString *className = NSStringFromClass([self class]);
+
+    // 过滤命中开屏、广告、倒计时的控制器类名
+    if ([className localizedCaseInsensitiveContainsString:@"Splash"] ||
+        [className localizedCaseInsensitiveContainsString:@"LaunchAd"] ||
+        [className localizedCaseInsensitiveContainsString:@"Advertisement"]) {
+
+        XCLog(@"Detected Splash VC: %@, dismissing immediately...", className);
+
+        // 尝试自动点击跳过按钮
+        [self dismissViewControllerAnimated:NO completion:nil];
+
+        // 如果当前是 RootViewController，尝试调用子控制器或通知导航切换
+        if (self.view.window && self.view.window.rootViewController == self) {
+            // 查找业务内可能保存的主界面或导航
+            [self.view setHidden:YES];
+            [self.view removeFromSuperview];
+        }
+    }
+}
+
+// 自动寻找并触发屏幕上的“跳过”/倒计时按钮
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+
+    NSString *className = NSStringFromClass([self class]);
+    if ([className localizedCaseInsensitiveContainsString:@"Splash"] ||
+        [className localizedCaseInsensitiveContainsString:@"Launch"]) {
+
+        // 遍历当前视图层级，找到所有可能包含“跳过”或倒计时的按钮并触发点击
+        for (UIView *subview in self.view.subviews) {
+            if ([subview isKindOfClass:[UIButton class]]) {
+                UIButton *btn = (UIButton *)subview;
+                NSString *title = [btn titleForState:UIControlStateNormal];
+                if ([title containsString:@"跳过"] || [title containsString:@"Skip"] || btn.tag == 1001) {
+                    XCLog(@"Found skip button, triggering click event!");
+                    [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
+                    break;
+                }
+            }
+        }
+    }
+}
+
 %end
+
+
+// =========================================================================
+// 策略 3：拦截多 Window 广告弹窗遮罩（秒删广告 Window）
+// =========================================================================
+
+%hook UIWindow
+
+- (void)becomeKeyWindow {
+    %orig;
+
+    NSString *className = NSStringFromClass([self class]);
+    // 很多广告 SDK（如穿山甲、Sigmob、乐盟）会独立新建一个覆盖在最上层的 UIWindow
+    if ([className localizedCaseInsensitiveContainsString:@"Splash"] ||
+        [className localizedCaseInsensitiveContainsString:@"AdWindow"]) {
+
+        XCLog(@"Detected Ad Window: %@, hiding it.", className);
+        self.hidden = YES;
+        [self resignKeyWindow];
+    }
+}
+
+%end
+
+
+// =========================================================================
+// 构造函数初始化提示
+// =========================================================================
+%ctor {
+    @autoreleasepool {
+        XCLog(@"=== XiaoCan NoSplash Dylib Loaded Successfully ===");
+    }
+}
