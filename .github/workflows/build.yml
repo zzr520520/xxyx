@@ -54,6 +54,14 @@ jobs:
       - name: Show build output
         run: ls -l dist/
 
+      # Actions 的 artifact 机制只能以 zip 形式提供下载，故此处产物为 zip
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XiaoCanAdBlock-dylib
+          path: dist/*.dylib
+          if-no-files-found: error
+
       # 每次构建都刷新一个滚动版本，保证 dylib 始终可从构建流直接下载（非 zip）
       - name: Publish rolling latest
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
