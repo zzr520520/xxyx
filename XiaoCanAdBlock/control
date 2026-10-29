@@ -1,7 +1,7 @@
 Package: com.yourname.xiaocanadblock
 Name: 小蚕惠生活去广告与开屏秒进
 Depends: mobilesubstrate (>= 0.9.5000)
-Version: 1.6.0
+Version: 1.7.0
 Architecture: iphoneos-arm
 Description: 深度去除小蚕惠生活开屏、信息流及竞价广告，实现秒进 APP。
 Maintainer: YourName
