@@ -9,12 +9,25 @@
 #import <dlfcn.h>
 #import <unistd.h>
 #import <dispatch/dispatch.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
 
 static CFAbsoluteTime kAppLaunchTime = 0;
 
-// 2.8.7 诊断用：启动期"阻塞原语"的调用次数与累计阻塞秒数（只统计，不改变行为）
-static volatile int    gCntSem = 0, gCntGrp = 0, gCntSlp = 0;
-static volatile double gBlkSem = 0, gBlkGrp = 0, gBlkSlp = 0;
+// 2.8.8：启动期"阻塞原语"记账（可选，仅用于本地排查）
+static volatile int    gCntSem = 0, gCntGrp = 0;
+static volatile double gBlkSem = 0, gBlkGrp = 0;
+
+// 把启动期"很长的等待"压到 100ms：2 秒超时不再真的等 2 秒
+static dispatch_time_t xcClampTimeout(dispatch_time_t t) {
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime > 8.0) return t;
+    if (t == DISPATCH_TIME_FOREVER) return t; // 永久等待语义不动，只削有限超时
+    dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
+    if (t > now && (int64_t)(t - now) > (int64_t)(0.2 * NSEC_PER_SEC)) {
+        return dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC));
+    }
+    return t;
+}
 
 // ============================================================================
 // 2.8.3 找回"秒开"，同时不再动首页
@@ -30,6 +43,14 @@ static volatile double gBlkSem = 0, gBlkGrp = 0, gBlkSlp = 0;
 // ============================================================================
 
 static BOOL gHomeMounted = NO; // 首页是否已挂载；一旦为 YES 就永不清图
+static CFAbsoluteTime gHomeMountedTime = 0; // 首页出现的时间点（诊断用）
+
+static void xcMarkHome(void) {
+    if (!gHomeMounted) {
+        gHomeMounted = YES;
+        gHomeMountedTime = CFAbsoluteTimeGetCurrent();
+    }
+}
 
 // 判断视图自身或任意祖先是否属于"启动页 / 开屏"命名族（精确词）
 static BOOL isLaunchOrSplashView(UIView *view) {
@@ -54,7 +75,7 @@ static BOOL isOrContainsHomeContent(UIView *view) {
     if ([clsName containsString:@"Flutter"] ||
         [clsName containsString:@"TabBar"] ||
         [clsName containsString:@"WKWebView"]) {
-        gHomeMounted = YES;
+        xcMarkHome();
         return YES;
     }
     UIResponder *next = [view nextResponder];
@@ -64,13 +85,13 @@ static BOOL isOrContainsHomeContent(UIView *view) {
             [vcName containsString:@"TabBar"] ||
             [vcName containsString:@"Main"] ||
             [vcName containsString:@"Home"]) {
-            gHomeMounted = YES;
+            xcMarkHome();
             return YES;
         }
     }
     for (UIView *sub in view.subviews) {
         if (isOrContainsHomeContent(sub)) {
-            gHomeMounted = YES;
+            xcMarkHome();
             return YES;
         }
     }
@@ -113,6 +134,17 @@ static void perform_rebinding_with_section(struct rebinding_entry *rebindings, s
                                            nlist_t *symtab, char *strtab, uint32_t *indirect_symtab) {
     uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
     void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+
+    // 2.8.8 关键：__got（S_NON_LAZY_SYMBOL_POINTERS）位于只读的 __DATA_CONST，
+    //    Swift 的 libswiftDispatch 很可能经 GOT 调用 dispatch_after_f / semaphore_wait，
+    //    旧代码只改 lazy 指针且不恢复页权限 → 命中不到，等于"时间加速"从未生效。
+    //    这里按真实页大小把目标页改成可写（VM_PROT_COPY 会在写入时得到私有副本）。
+    uintptr_t pg = (uintptr_t)getpagesize();
+    vm_address_t pageStart = (vm_address_t)indirect_symbol_bindings & ~(pg - 1);
+    vm_size_t pageSize = (vm_size_t)section->size + ((vm_address_t)indirect_symbol_bindings - pageStart);
+    vm_protect(mach_task_self(), pageStart, pageSize, false,
+               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+
     for (uint i = 0; i < section->size / sizeof(void *); i++) {
         uint32_t symtab_index = indirect_symbol_indices[i];
         if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
@@ -186,7 +218,10 @@ static void rebind_symbols_for_image(const struct mach_header *header, intptr_t 
             }
             for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
                 section_t *sect = (section_t *)(cur + sizeof(segment_command_t)) + j;
-                if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
+                // 2.8.8：同时处理 lazy（stub）与 non-lazy（__got）两种导入指针表，
+                // 只改 lazy 会漏掉 Swift 侧经 GOT 直连 dispatch_* 的调用点。
+                uint32_t stype = sect->flags & SECTION_TYPE;
+                if (stype == S_LAZY_SYMBOL_POINTERS || stype == S_NON_LAZY_SYMBOL_POINTERS) {
                     perform_rebinding_with_section(kGlobalRebindings, kGlobalRebindingsCount, sect, slide, symtab, strtab, indirect_symtab);
                 }
             }
@@ -199,11 +234,12 @@ static void (*orig_dispatch_after_f)(dispatch_time_t when, dispatch_queue_t queu
 static void (*orig_dispatch_source_set_timer)(dispatch_source_t source, dispatch_time_t start, uint64_t interval, uint64_t leeway) = NULL;
 
 static void hooked_dispatch_after(dispatch_time_t when, dispatch_queue_t queue, dispatch_block_t block) {
-    // 启动前 4.5 秒内，主线程上 >0.15s 的延迟任务（开屏停留/闪屏等待）直接压到 1 毫秒
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 4.5 && queue == dispatch_get_main_queue()) {
+    // 2.8.8：不再限制队列，窗口放宽到 8s。启动期任何 >0.2s 的延迟任务都压到 10ms
+    //（之前只压主队列、窗口 5s，若开屏等待排在后台上或第 5~8 秒才发起就漏掉了）
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 8.0) {
         dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
-        if (when > now + (int64_t)(0.15 * NSEC_PER_SEC)) {
-            when = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.001 * NSEC_PER_SEC));
+        if (when > now + (int64_t)(0.2 * NSEC_PER_SEC)) {
+            when = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.01 * NSEC_PER_SEC));
         }
     }
     if (orig_dispatch_after) {
@@ -212,11 +248,11 @@ static void hooked_dispatch_after(dispatch_time_t when, dispatch_queue_t queue, 
 }
 
 static void hooked_dispatch_after_f(dispatch_time_t when, dispatch_queue_t queue, void *context, dispatch_function_t work) {
-    // Swift 的 DispatchQueue.main.asyncAfter 走这里
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 4.5 && queue == dispatch_get_main_queue()) {
+    // Swift 的 DispatchQueue.asyncAfter 走这里（主队列/后台队列都压）
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 8.0) {
         dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
-        if (when > now + (int64_t)(0.15 * NSEC_PER_SEC)) {
-            when = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.001 * NSEC_PER_SEC));
+        if (when > now + (int64_t)(0.2 * NSEC_PER_SEC)) {
+            when = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.01 * NSEC_PER_SEC));
         }
     }
     if (orig_dispatch_after_f) {
@@ -240,33 +276,29 @@ static void hooked_dispatch_source_set_timer(dispatch_source_t source, dispatch_
     }
 }
 
-// 2.8.7 诊断：统计主线程在 dispatch_semaphore_wait / dispatch_group_wait 上被阻塞的时长
-// 只计时、不改变等待行为，用来判断"启动慢"到底卡在哪个原语上
+// 2.8.8 关键修复：启动期的"长超时等待"直接削短
+// 抓包显示 0.4→2.5s、3.8→5.8s 各有约 2 秒空转；定时器加速无效，说明卡在
+// 带 2 秒超时的信号量 / 组等待（等广告 SDK 初始化，而我们已把广告网络拦死）。
+// 这里把有限超时压到 100ms，等待不再真的耗满 2 秒；永久等待不动，避免破坏语义。
 static long (*orig_dispatch_semaphore_wait)(dispatch_semaphore_t dsema, dispatch_time_t timeout) = NULL;
 static long (*orig_dispatch_group_wait)(dispatch_group_t group, dispatch_time_t timeout) = NULL;
 
 static long hooked_dispatch_semaphore_wait(dispatch_semaphore_t dsema, dispatch_time_t timeout) {
     if (!orig_dispatch_semaphore_wait) return 0;
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0 && [NSThread isMainThread]) {
-        CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
-        long r = orig_dispatch_semaphore_wait(dsema, timeout);
-        gBlkSem += CFAbsoluteTimeGetCurrent() - a;
-        gCntSem++;
-        return r;
-    }
-    return orig_dispatch_semaphore_wait(dsema, timeout);
+    CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
+    long r = orig_dispatch_semaphore_wait(dsema, xcClampTimeout(timeout));
+    double d = CFAbsoluteTimeGetCurrent() - a;
+    if (d > 0.05) { gBlkSem += d; gCntSem++; }
+    return r;
 }
 
 static long hooked_dispatch_group_wait(dispatch_group_t group, dispatch_time_t timeout) {
     if (!orig_dispatch_group_wait) return 0;
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0 && [NSThread isMainThread]) {
-        CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
-        long r = orig_dispatch_group_wait(group, timeout);
-        gBlkGrp += CFAbsoluteTimeGetCurrent() - a;
-        gCntGrp++;
-        return r;
-    }
-    return orig_dispatch_group_wait(group, timeout);
+    CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
+    long r = orig_dispatch_group_wait(group, xcClampTimeout(timeout));
+    double d = CFAbsoluteTimeGetCurrent() - a;
+    if (d > 0.05) { gBlkGrp += d; gCntGrp++; }
+    return r;
 }
 
 // ============================================================================
@@ -361,7 +393,7 @@ static long hooked_dispatch_group_wait(dispatch_group_t group, dispatch_time_t t
     // 首页控制器出现 → 永久关闭清图逻辑（不再触碰任何视图）
     if ([vcName containsString:@"Flutter"] || [vcName containsString:@"Main"] ||
         [vcName containsString:@"Home"] || [vcName containsString:@"TabBar"]) {
-        gHomeMounted = YES;
+        xcMarkHome();
     }
 
     if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 6.0) {
@@ -394,7 +426,7 @@ static long hooked_dispatch_group_wait(dispatch_group_t group, dispatch_time_t t
     if ([clsName containsString:@"Flutter"] ||
         [clsName containsString:@"TabBar"] ||
         [clsName containsString:@"WKWebView"]) {
-        gHomeMounted = YES;
+        xcMarkHome();
     }
 
     if ([clsName containsString:@"LaunchView"] ||
@@ -471,17 +503,14 @@ static long hooked_dispatch_group_wait(dispatch_group_t group, dispatch_time_t t
 
 %end
 
-// 2.8.7 诊断：统计 NSThread 睡眠（有些 SDK 用 [NSThread sleepForTimeInterval:] 等待）
+// 2.8.8：启动期主线程上的"睡眠等待"直接削到 10ms
+//（有些 SDK 用 [NSThread sleepForTimeInterval:] / 或用定时器等待，定时器加速无效时往往就是它在拖）
 %hook NSThread
 + (void)sleepForTimeInterval:(NSTimeInterval)ti {
-    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0 && [NSThread isMainThread]) {
-        CFAbsoluteTime a = CFAbsoluteTimeGetCurrent();
-        %orig(ti);
-        gBlkSlp += CFAbsoluteTimeGetCurrent() - a;
-        gCntSlp++;
-    } else {
-        %orig(ti);
+    if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime < 12.0 && [NSThread isMainThread] && ti > 0.05) {
+        ti = 0.01;
     }
+    %orig(ti);
 }
 %end
 
@@ -502,7 +531,9 @@ static NSString * const kBlockedAdHosts[] = {
     @"1rtb.com", @"yunxish.com", @"58iclick.com", @"iggrowth.cn",
     @"innotechx.com", @"etoolads.cn", @"zhangyuyidong.cn", @"hubcloud.com.cn",
     @"nwiztech.com", @"kuaishou.com", @"gifshow.com",
-    @"iadsdk.apple.com", @"adservices.apple.com"
+    @"iadsdk.apple.com", @"adservices.apple.com",
+    @"sensorsdata.xiaocanapp.com", // 2.8.8：埋点上报，启动期省掉这段网络开销
+    @"ido.gepush.com"              // 2.8.8：个推启动上报
 };
 
 static const size_t kBlockedAdHostsCount = sizeof(kBlockedAdHosts) / sizeof(kBlockedAdHosts[0]);
@@ -520,15 +551,56 @@ static BOOL shouldBlockAdURL(NSURL *url) {
     return NO;
 }
 
-static BOOL isXiaoCanAdRPC(NSURLRequest *request) {
-    if (!request || !request.URL) return NO;
-    if (![[request.URL.absoluteString lowercaseString] containsString:@"gw.xiaocantech.com/rpc"]) return NO;
-    NSString *methodName = [request valueForHTTPHeaderField:@"methodname"] ?: @"";
-    NSString *serverName = [request valueForHTTPHeaderField:@"servername"] ?: @"";
-    if ([methodName containsString:@"MatchPlacement"] || [methodName containsString:@"AdMobileService"] || [serverName isEqualToString:@"SilkwormAd"]) {
-        return YES;
+// 2.8.8：恢复 2.7.0 里被 2.8.x 丢掉的"启动期秒回"。
+// 抓包显示这些接口都在启动路径上串行等待（每个 200~460ms，累积拖慢进首页），
+// 本地直接返回等价 JSON，0ms 完成，不再占住启动线程。
+// 返回 nil = 不拦截（走真实网络）。
+static NSString *getFakeRPCResponseIfNeeded(NSURLRequest *request) {
+    if (!request || !request.URL) return nil;
+    NSString *absURL = [request.URL.absoluteString lowercaseString];
+
+    if ([absURL containsString:@"gw.xiaocantech.com/rpc"]) {
+        NSString *methodName = [request valueForHTTPHeaderField:@"methodname"] ?: @"";
+        NSString *serverName = [request valueForHTTPHeaderField:@"servername"] ?: @"";
+
+        // 开屏广告位匹配 -> 秒回 ad_open:0（等价"无开屏广告"）
+        if ([methodName containsString:@"MatchPlacement"] || [serverName isEqualToString:@"SilkwormAd"]) {
+            if ([methodName containsString:@"GetUserInfo"]) {
+                return @"{\"status\":{\"code\":0},\"data\":{\"module_open\":0,\"show_exchange_silk_entry\":false}}";
+            }
+            return @"{\"status\":{\"code\":0},\"data\":{\"ad_open\":0,\"ad_type\":[],\"ad_source\":[],\"ios_slot_id\":\"\",\"put_id\":0}}";
+        }
+        if ([serverName isEqualToString:@"SilkwormAdMonitor"]) {
+            return @"{\"status\":{\"code\":0}}";
+        }
+        // 启动期弹窗全部秒回"不展示"，避免进首页后再弹
+        if ([methodName isEqualToString:@"NewUserMobileService.IsNewUserAndShowPopup"]) {
+            return @"{\"status\":{\"code\":0},\"activity\":{\"show\":false,\"users\":null,\"is_new_user\":false,\"source\":0}}";
+        }
+        if ([methodName isEqualToString:@"NewUserMobileService.IsShowOrderAwardPopup"]) {
+            return @"{\"status\":{\"code\":0},\"show\":false,\"order_tip\":null,\"is_new_user\":false,\"target_show\":false,\"target_order_tip\":null}";
+        }
+        if ([methodName isEqualToString:@"SilkwormMobileMarketingService.GetUserMarketingInfoV2"]) {
+            return @"{\"status\":{\"code\":0},\"if_receive_add_gift\":false,\"if_promotion_muster\":false,\"if_force_screen\":false,\"if_celebrate\":false,\"if_page_gift\":false}";
+        }
+        if ([methodName isEqualToString:@"SilkwormVipMobile.VipPopup"]) {
+            return @"{\"status\":{\"code\":0},\"list\":[{\"is_showed\":true,\"popup_type\":5}]}";
+        }
+        // 启动期 AB 实验分组检查 -> 本地秒回对照组
+        if ([methodName isEqualToString:@"ExperimentService.CheckUserInGroup"]) {
+            return @"{\"status\":{\"code\":0},\"group\":{\"id\":540,\"name\":\"A\",\"weight\":50,\"context\":\"{}\",\"white_list\":null,\"is_control\":true}}";
+        }
     }
-    return NO;
+
+    // 启动期 OSS 配置 JSON -> 本地秒回
+    if ([absURL containsString:@"native_order_config.json"]) {
+        return @"{\"open_native\":true,\"open_ios_native\":true,\"open_android_native\":true,\"open_ohos_native\":true,\"open_flutter_native\":true}";
+    }
+    if ([absURL containsString:@"server_downtime.json"]) {
+        return @"{\"message\":\"\",\"open\":false}";
+    }
+
+    return nil;
 }
 
 @interface XCFastAdBlockProtocol : NSURLProtocol
@@ -538,7 +610,7 @@ static BOOL isXiaoCanAdRPC(NSURLRequest *request) {
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     if ([NSURLProtocol propertyForKey:@"XCAdHandled" inRequest:request]) return NO;
-    if (isXiaoCanAdRPC(request) || shouldBlockAdURL(request.URL)) return YES;
+    if (getFakeRPCResponseIfNeeded(request) != nil || shouldBlockAdURL(request.URL)) return YES;
     return NO;
 }
 
@@ -547,8 +619,9 @@ static BOOL isXiaoCanAdRPC(NSURLRequest *request) {
 - (void)startLoading {
     NSMutableURLRequest *mutableReq = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"XCAdHandled" inRequest:mutableReq];
-    if (isXiaoCanAdRPC(self.request)) {
-        NSData *data = [@"{\"status\":{\"code\":0},\"data\":{\"ad_open\":0,\"ad_type\":[],\"ad_source\":[],\"ios_slot_id\":\"\",\"put_id\":0}}" dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *fakeJson = getFakeRPCResponseIfNeeded(self.request);
+    if (fakeJson) {
+        NSData *data = [fakeJson dataUsingEncoding:NSUTF8StringEncoding];
         NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"application/json"}];
         [self.client URLProtocol:self didReceiveResponse:resp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
         [self.client URLProtocol:self didLoadData:data];
@@ -584,115 +657,16 @@ static BOOL isXiaoCanAdRPC(NSURLRequest *request) {
 %end
 
 // ============================================================================
-// 6. 启动诊断面层（2.8.7 临时，只看不改）
+// 6. 启动期阻塞等待：不再"只统计"，直接削短（2.8.8）
 // ----------------------------------------------------------------------------
-// 前几版一直在"秒进 / 白屏 / 丢图"之间摇摆，根因始终没坐实。这一版不加任何去广告/
-// 加速功能，只把"启动到底卡在哪"直接画在屏幕上：
-//   (1) t=… bg=… main=…  → bg 一直涨、main 不动 = 主线程被阻塞（卡住）
-//   (2) 每个 UIWindow 的真实类名 / 顶层视图链 / 是否已含首页(Flutter/TabBar/Lynx)
-//   (3) 启动期阻塞原语的调用次数与累计秒数：sem=信号量 grp=DispatchGroup slp=睡眠
-// 请截两张图：约 2 秒时一张、约 5～6 秒时一张。30 秒后自动消失。
+// 抓包坐实：启动期有两段各约 2 秒的静默期（0.6→2.5s、3.8→5.8s），既没有网络、
+// 定时器加速也无效 —— 这是主线程被"带超时的阻塞等待"卡住（报告指出开屏由
+// AdManager.initGroup(DispatchGroup) 作为多通道初始化同步点）。所以这一版直接：
+//   dispatch_semaphore_wait / dispatch_group_wait 的有限超时 → 100ms
+//   dispatch_after / after_f 启动期 >0.2s 的延迟 → 10ms（不限队列）
+//   NSThread sleepForTimeInterval 启动期主线程 → 10ms
+// 让主线程不再被困住，首页数据更早拿到，Flutter 内容更早渲染。
 // ============================================================================
-static UIWindow *gDiagWindow = nil;
-static UILabel *gDiagLabel = nil;
-static volatile int gBgTick = 0, gMainTick = 0, gMainPending = 0;
-static volatile BOOL gDiagReady = NO;
-
-static NSString *xcDiagTopChain(UIView *root, int depth) {
-    NSMutableString *chain = [NSMutableString string];
-    UIView *v = root;
-    for (int i = 0; i < depth; i++) {
-        if (v.subviews.count == 0) break;
-        v = v.subviews.lastObject;
-        [chain appendFormat:@"%@>", NSStringFromClass([v class])];
-    }
-    return chain;
-}
-
-static BOOL xcDiagHasHome(UIView *view, int depth) {
-    if (!view || depth > 20) return NO;
-    NSString *cls = NSStringFromClass([view class]);
-    if ([cls containsString:@"Flutter"] || [cls containsString:@"TabBar"] ||
-        [cls containsString:@"WKWebView"] || [cls containsString:@"Lynx"]) {
-        return YES;
-    }
-    for (UIView *sub in view.subviews) {
-        if (xcDiagHasHome(sub, depth + 1)) return YES;
-    }
-    return NO;
-}
-
-static NSString *xcDiagText(void) {
-    NSMutableString *s = [NSMutableString string];
-    double el = CFAbsoluteTimeGetCurrent() - kAppLaunchTime;
-    int lag = gBgTick - gMainTick;
-    [s appendFormat:@"t=%.1fs bg=%d main=%d %@\n", el, gBgTick, gMainTick,
-        (lag > 2 ? @"<<主线程被阻塞>>" : @"主线程在跑")];
-    [s appendFormat:@"blk sem=%d(%.1fs) grp=%d(%.1fs) slp=%d(%.1fs)\n",
-        gCntSem, gBlkSem, gCntGrp, gBlkGrp, gCntSlp, gBlkSlp];
-
-    NSArray<UIWindow *> *wins = [UIApplication sharedApplication].windows;
-    [s appendFormat:@"windows=%lu\n", (unsigned long)wins.count];
-    int idx = 0;
-    for (UIWindow *w in wins) {
-        if (idx >= 3) break;
-        NSString *vc = w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"-";
-        [s appendFormat:@"W%d %@ h%d%@\n  vc=%@\n  >%@\n  home=%d\n",
-            idx, NSStringFromClass([w class]), (int)w.hidden,
-            (w.isKeyWindow ? @" KEY" : @""), vc,
-            xcDiagTopChain(w, 5), (int)xcDiagHasHome(w, 0)];
-        idx++;
-    }
-    return s;
-}
-
-static void xcDiagSetup(void) {
-    CGRect scr = [UIScreen mainScreen].bounds;
-    CGFloat h = 340;
-    gDiagWindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 48, scr.size.width, h)];
-    gDiagWindow.windowLevel = UIWindowLevelAlert + 100;
-    gDiagWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.72];
-    gDiagWindow.userInteractionEnabled = NO;
-    UIViewController *vc = [[UIViewController alloc] init];
-    gDiagWindow.rootViewController = vc;
-    gDiagLabel = [[UILabel alloc] initWithFrame:CGRectMake(4, 2, scr.size.width - 8, h - 4)];
-    gDiagLabel.numberOfLines = 0;
-    gDiagLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
-    UIFont *f = [UIFont fontWithName:@"Menlo" size:9.0];
-    gDiagLabel.font = f ?: [UIFont systemFontOfSize:9.0];
-    gDiagLabel.text = @"diag booting...";
-    [vc.view addSubview:gDiagLabel];
-    gDiagWindow.hidden = NO;
-    gDiagReady = YES;
-}
-
-static void xcDiagStart(void) {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        for (;;) {
-            usleep(300 * 1000);
-            gBgTick++;
-            // 后台每 0.3s 往主线程塞一次刷新；主线程被阻塞时这里就不会执行 → main 计数停住
-            if (!gMainPending) {
-                gMainPending = 1;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    gMainPending = 0;
-                    gMainTick++;
-                    if (!gDiagReady) {
-                        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                            if (w.isKeyWindow) { xcDiagSetup(); break; }
-                        }
-                    }
-                    if (gDiagReady) gDiagLabel.text = xcDiagText();
-                });
-            }
-            if (CFAbsoluteTimeGetCurrent() - kAppLaunchTime > 30.0) break;
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            gDiagLabel.hidden = YES;
-            gDiagWindow.hidden = YES;
-        });
-    });
-}
 
 %ctor {
     @autoreleasepool {
@@ -706,7 +680,7 @@ static void xcDiagStart(void) {
         kGlobalRebindings[0] = (struct rebinding_entry){ "dispatch_after", (void *)hooked_dispatch_after, (void **)&orig_dispatch_after };
         kGlobalRebindings[1] = (struct rebinding_entry){ "dispatch_after_f", (void *)hooked_dispatch_after_f, (void **)&orig_dispatch_after_f };
         kGlobalRebindings[2] = (struct rebinding_entry){ "dispatch_source_set_timer", (void *)hooked_dispatch_source_set_timer, (void **)&orig_dispatch_source_set_timer };
-        // 3. 诊断：统计（不改变）主线程在信号量/组等待上的阻塞
+        // 3. 关键修复：启动期"长超时阻塞等待"直接削短（信号量 / DispatchGroup 的 ~2s 超时 → 100ms）
         if (!orig_dispatch_semaphore_wait) orig_dispatch_semaphore_wait = (long (*)(dispatch_semaphore_t, dispatch_time_t))dlsym(RTLD_DEFAULT, "dispatch_semaphore_wait");
         if (!orig_dispatch_group_wait) orig_dispatch_group_wait = (long (*)(dispatch_group_t, dispatch_time_t))dlsym(RTLD_DEFAULT, "dispatch_group_wait");
         kGlobalRebindings[3] = (struct rebinding_entry){ "dispatch_semaphore_wait", (void *)hooked_dispatch_semaphore_wait, (void **)&orig_dispatch_semaphore_wait };
@@ -714,8 +688,5 @@ static void xcDiagStart(void) {
         kGlobalRebindingsCount = 5;
 
         _dyld_register_func_for_add_image(rebind_symbols_for_image);
-
-        // 4. 启动诊断面层
-        xcDiagStart();
     }
 }
