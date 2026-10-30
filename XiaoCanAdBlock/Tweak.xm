@@ -88,7 +88,12 @@ static BOOL isAdOrSplashRequest(NSURLRequest *request, BOOL *isMatchPlacement) {
                 completionHandler(data, resp, nil);
             });
         }
+        // NSURLSessionDataTask 的 -init 在 iOS 13+ 被标记 deprecated，编译开启 -Werror 会报错；
+        // 这里的哑任务只是占位对象，不会有真实网络行为，局部关闭该告警即可。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         return [[XCDummyDataTask alloc] init];
+#pragma clang diagnostic pop
     }
     return %orig;
 }
